@@ -230,11 +230,13 @@ int main(int argc, char **argv) {
     const uint8_t *mv_ptr = bs + 8U;
     const uint8_t *rec_ptr = bs + 8U + mv_bytes; /* uint32 words, unaligned */
 
-    /* Keep record_words even (2 words per record) and chunk at <= 280 words (1120B)
-     * when network impairment is active (independent slice resilience);
-     * on clean RIO, send records in 1 batched zc_video_tx_send_ternary_packet call (1 doorbell). */
-    const uint32_t max_words_per_pkt = has_impair ? impaired_words_per_pkt
-                                                  : (record_words > 0 ? record_words : 1U);
+    const bool use_fec_frame = (has_impair && fec_shards > 0 && (f >= 16U || (impair.reorder_pct == 0 && impair.jitter_us == 0)));
+    const uint32_t max_words_per_pkt = use_fec_frame
+                                           ? ((impair.reorder_pct > 0 || impair.jitter_us > 0)
+                                                  ? (record_words > 0 ? record_words : 1U)
+                                                  : ((uint32_t)fec_shards * 420U))
+                                           : (has_impair ? impaired_words_per_pkt
+                                                         : (record_words > 0 ? record_words : 1U));
     uint32_t num_slices = (record_words == 0) ? 0U : ((record_words + max_words_per_pkt - 1U) / max_words_per_pkt);
     /* Transport ids are f * 2048 + 1 + slice: more would alias the next frame. */
     if (num_slices > 2047U || num_slices > slice_seen_cap) continue;
@@ -271,7 +273,8 @@ int main(int argc, char **argv) {
       zcrudp_ternary_pkt_hdr_t dhdr = {
           .magic = ZCRUDP_TERNARY_PKT_MAGIC,
           .pixfmt = ZCRUDP_TERNARY_MAKE_PF(ZCRUDP_TERNARY_FMT_GRAY8,
-                                           ZCRUDP_TERNARY_PKT_DELTA),
+                                           use_fec_frame ? ZCRUDP_TERNARY_PKT_INTRA
+                                                         : ZCRUDP_TERNARY_PKT_DELTA),
           .plane = (uint8_t)(s + 1U == num_slices ? 1U : 0U),
           .frame_id = (uint16_t)(f & 0xFFFFU),
           .start_block = s,
@@ -299,7 +302,7 @@ int main(int argc, char **argv) {
     uint64_t t_rx0 = qpc_now_us();
     uint64_t last_rx_us = t_rx0;
     uint64_t wait_deadline = t_rx0 + ((has_impair || keyframe || f < 16U) ? 50000ULL : 10000ULL);
-    uint64_t idle_grace_us = has_impair ? 2500ULL : 200ULL;
+    uint64_t idle_grace_us = has_impair ? ((uint64_t)impair.base_owd_us + (uint64_t)impair.jitter_us + 800ULL) : 200ULL;
 
     while (qpc_now_us() < wait_deadline) {
       if (has_impair) {
@@ -327,7 +330,8 @@ int main(int argc, char **argv) {
                 got_mv = true;
               }
               expected_slices = rhdr.start_block;
-            } else if (rhdr.start_block < num_slices && !slice_seen[rhdr.start_block]) {
+            } else if ((ptype == ZCRUDP_TERNARY_PKT_DELTA || ptype == ZCRUDP_TERNARY_PKT_INTRA) &&
+                       rhdr.start_block < num_slices && !slice_seen[rhdr.start_block]) {
               /* Records carry their own position, so slices may be appended
                * in arrival order; a duplicated datagram is dropped here. */
               slice_seen[rhdr.start_block] = 1U;

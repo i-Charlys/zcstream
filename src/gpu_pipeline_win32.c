@@ -149,6 +149,7 @@ struct gpu_pipeline_s {
   uint32_t tern_rc_threshold;
   uint32_t tern_rc_intra_err_thr;
   bool tern_rc_2x;
+  bool tern_static_scene;
   bool tern_dec_use_copy;
   ID3D11ComputeShader *tern_cs_tile_mv;
   ID3D11ComputeShader *tern_cs_encode;
@@ -1277,6 +1278,9 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
     uint32_t intra_cycles = (p->height + rows_per_frame - 1U) / rows_per_frame;
     if (intra_cycles < 30U) intra_cycles = 30U;
     if (intra_cycles > 480U) intra_cycles = 480U;
+    if (p->tern_static_scene && frame_idx >= 16U) {
+      intra_cycles = (p->height > 720U) ? p->height : 720U;
+    }
 
     uint32_t mode_flags = (frame_idx < 16U) ? 1U : (p->tern_rc_2x ? 1U : 0U);
     uint32_t eff_blocks = (mode_flags != 0U) ? ((p->tern_total_blocks + 1U) >> 1)
@@ -1359,6 +1363,7 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
     memcpy(p->enc_out_buf + sizeof(uint32_t), &mv_bytes, sizeof(uint32_t));
 
     /* Closed-loop frame rate controller (skip initial 16-frame convergence burst) */
+    p->tern_static_scene = (mv_bytes == 0U && raw_words < (target_words / 2U));
     if (frame_idx >= 16U) {
       if (raw_words > target_words + (target_words >> 3)) {
         if (!p->tern_rc_2x && raw_words > target_words + (target_words >> 1)) {
