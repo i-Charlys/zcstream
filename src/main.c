@@ -78,6 +78,10 @@ int main(int argc, char **argv) {
 
   SOCKET rx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   SOCKET tx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (rx_sock == INVALID_SOCKET || tx_sock == INVALID_SOCKET) {
+    fprintf(stderr, "socket failed: %d\n", WSAGetLastError());
+    return 1;
+  }
 
   int rcvbuf = 4 * 1024 * 1024;
   setsockopt(rx_sock, SOL_SOCKET, SO_RCVBUF, (const char *)&rcvbuf, sizeof(rcvbuf));
@@ -134,13 +138,19 @@ int main(int argc, char **argv) {
   double *dec_arr = (double *)calloc(num_frames, sizeof(double));
   double *prs_arr = (double *)calloc(num_frames, sizeof(double));
   double *tot_arr = (double *)calloc(num_frames, sizeof(double));
+  if (!cap_arr || !enc_arr || !ntx_arr || !nrx_arr || !dec_arr || !prs_arr || !tot_arr) {
+    fprintf(stderr, "out of memory\n");
+    return 1;
+  }
   size_t measured = 0;
   size_t total_bytes = 0;
   size_t sent_frames = 0;
 
   uint8_t rx_pkt[2048];
   const uint32_t warmup = 60;
-  bool has_delay_queue = (impair.base_owd_us > 0 || impair.jitter_us > 0 || impair.reorder_pct > 0);
+  /* Duplicates also sit in the bridge's delay queue (+200 us). */
+  bool has_delay_queue = (impair.base_owd_us > 0 || impair.jitter_us > 0 ||
+                          impair.reorder_pct > 0 || impair.dup_pct > 0);
 
   for (uint32_t f = 0; f < (uint32_t)(num_frames + warmup); ++f) {
     if (show_window && !gpu_pipeline_pump_events(gpu)) break;
@@ -167,9 +177,14 @@ int main(int argc, char **argv) {
     uint32_t rx_fid = 0;
     bool rx_kf = false, rx_fec = false;
 
+    /* Loopback delivery is asynchronous: an empty socket right after the
+     * send does not mean the frame is lost, so poll until the deadline.
+     * Once a datagram of this frame was dropped on purpose and nothing more
+     * is queued, the frame cannot complete and waiting is pointless. */
     uint64_t wait_limit_us = has_delay_queue
         ? (uint64_t)(impair.base_owd_us + impair.jitter_us + 8500U)
-        : 200U;
+        : 2000U;
+    uint64_t drops_before = tx->packets_dropped_sim;
 
     while ((qpc_now_us() - t_rx0) <= wait_limit_us) {
       if (has_delay_queue) {
@@ -179,10 +194,18 @@ int main(int argc, char **argv) {
       if (rlen > 0) {
         if (zc_video_rx_feed(rx, rx_pkt, (size_t)rlen, &rx_len, &rx_fid,
                              &rx_kf, &rx_fec) == 1) {
-          got_frame = true;
-          break;
+          if (rx_fid == f) {
+            got_frame = true;
+            break;
+          }
+          /* A late earlier frame: decode it to keep the H.264 reference
+           * chain intact, but do not time it as the current frame. */
+          double late_dec = 0, late_prs = 0;
+          (void)gpu_pipeline_decode_and_present(gpu, rx->frame_buf, rx_len,
+                                                &late_dec, &late_prs);
         }
-      } else if (!has_delay_queue) {
+      } else if (!has_delay_queue && tx->packets_dropped_sim != drops_before &&
+                 (qpc_now_us() - t_rx0) > 300U) {
         break;
       }
     }
@@ -212,12 +235,13 @@ int main(int argc, char **argv) {
 
   printf("Frames Sent    : %zu | Delivered & Decoded: %zu (%.1f%%)\n",
          sent_frames, measured, sent_frames ? (100.0 * (double)measured / (double)sent_frames) : 0.0);
-  printf("Network TX     : %llu sent | %llu dropped(sim) | %llu reordered | %llu dup | %llu FEC pkts\n",
+  printf("Network TX     : %llu sent | %llu dropped(sim) | %llu reordered | %llu dup | %llu FEC pkts | %llu send errors\n",
          (unsigned long long)tx->packets_sent,
          (unsigned long long)tx->packets_dropped_sim,
          (unsigned long long)tx->packets_reordered_sim,
          (unsigned long long)tx->packets_duplicated_sim,
-         (unsigned long long)tx->fec_packets_sent);
+         (unsigned long long)tx->fec_packets_sent,
+         (unsigned long long)tx->send_errors);
   printf("Network RX     : %llu completed | %llu FEC-recovered | %llu ooo-pkts | %llu dup-ignored | %llu dropped\n\n",
          (unsigned long long)rx->frames_completed,
          (unsigned long long)rx->frames_fec_recovered,
@@ -226,6 +250,10 @@ int main(int argc, char **argv) {
          (unsigned long long)rx->frames_dropped);
 
   if (measured > 0) {
+    double avg_mbps = ((double)total_bytes * 8.0 * (double)fps) /
+                      ((double)measured * 1000000.0);
+    printf("Avg bitrate    : %.2f Mbps (%.1f KB/frame)\n",
+           avg_mbps, ((double)total_bytes / (double)measured) / 1024.0);
     printf("--- End-to-End Pipeline Latency Breakdown (microseconds) ---\n");
     print_stat_row("1. Capture+NV12", cap_arr, measured);
     print_stat_row("2. HW Encode", enc_arr, measured);

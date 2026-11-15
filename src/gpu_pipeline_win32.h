@@ -38,6 +38,26 @@ int gpu_pipeline_create(gpu_pipeline_t **out_pipe, uint32_t width,
                         uint32_t height, uint32_t fps, uint32_t bitrate_bps,
                         bool show_window, gpu_pipeline_info_t *out_info);
 
+/**
+ * Creates a GPU pipeline backed by tern_vid HLSL compute shaders (cs_5_0)
+ * for zero-copy VRAM ternary encoding/decoding.
+ */
+int gpu_pipeline_create_ternary(gpu_pipeline_t **out_pipe, uint32_t width,
+                                uint32_t height, uint32_t fps,
+                                uint32_t threshold, uint32_t delta_step,
+                                uint32_t gamma_q8, uint32_t neutral_y,
+                                bool show_window, gpu_pipeline_info_t *out_info);
+
+/** Optional PSNR (luma Y) check between captured VRAM texture and decoded VRAM texture. */
+int gpu_pipeline_ternary_compute_psnr(gpu_pipeline_t *pipe, double *out_psnr_db);
+
+/**
+ * Counts pixels whose encoder reference word (Y/Cb/Cr/step) differs from the
+ * decoder reconstruction of the last decoded frame. Always 0 on a lossless
+ * link; anything else means the two HLSL closed loops have diverged.
+ */
+int gpu_pipeline_ternary_ref_mismatch(gpu_pipeline_t *pipe, uint64_t *out_mismatch_px);
+
 void gpu_pipeline_destroy(gpu_pipeline_t *pipe);
 
 /** Captures (or GPU-renders) one frame in VRAM and encodes it to H.264. */

@@ -5,8 +5,10 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <d3d11_1.h>
+#include <d3dcompiler.h>
 #include <dxgi1_2.h>
 #include <dxgi1_5.h>
+#include <math.h>
 #include <mfapi.h>
 #include <mferror.h>
 #include <mfidl.h>
@@ -72,9 +74,12 @@ struct gpu_pipeline_s {
   bool window_closed;
   bool tearing_supported;
   bool using_desktop_dup;
+  bool dupl_has_frame; /* cap_bgra_tex holds a duplicated desktop frame */
 
   ID3D11Device *dev;
   ID3D11DeviceContext *ctx;
+  ID3D11DeviceContext1 *ctx1;
+  bool fallback_bg_init;
   ID3D11VideoDevice *vdev;
   ID3D11VideoContext *vctx;
   ID3D11VideoProcessorEnumerator *vp_enum;
@@ -104,6 +109,50 @@ struct gpu_pipeline_s {
 
   uint8_t *enc_out_buf;
   size_t enc_out_cap;
+
+  /* Ternary HLSL Compute (cs_5_0) zero-copy VRAM state */
+  bool use_ternary;
+  uint32_t tern_threshold;
+  uint32_t tern_delta_min;
+  uint32_t tern_delta_max;
+  uint32_t tern_gamma_q8;
+  uint32_t tern_neutral_y;
+  uint32_t tern_total_blocks;
+  uint32_t tern_tiles_x;
+  uint32_t tern_tiles_y;
+  uint32_t tern_max_record_words;
+  uint32_t tern_enc_ping;
+  uint32_t tern_dec_ping;
+  bool tern_dec_use_copy;
+  ID3D11ComputeShader *tern_cs_tile_mv;
+  ID3D11ComputeShader *tern_cs_encode;
+  ID3D11ComputeShader *tern_cs_motion_decay;
+  ID3D11ComputeShader *tern_cs_apply;
+  ID3D11ComputeShader *tern_cs_ycbcr_to_rgba;
+  ID3D11ShaderResourceView *cap_bgra_srv;
+  ID3D11Buffer *tern_enc_yuvd_buf[2];
+  ID3D11ShaderResourceView *tern_enc_yuvd_srv[2];
+  ID3D11UnorderedAccessView *tern_enc_yuvd_uav[2];
+  ID3D11Buffer *tern_enc_mvs_buf;
+  ID3D11UnorderedAccessView *tern_enc_mvs_uav;
+  ID3D11Buffer *tern_enc_mvs_stg;
+  ID3D11Buffer *tern_out_records_buf;
+  ID3D11UnorderedAccessView *tern_out_records_uav;
+  ID3D11Buffer *tern_out_records_stg;
+  ID3D11Buffer *tern_out_counter_buf;
+  ID3D11UnorderedAccessView *tern_out_counter_uav;
+  ID3D11Buffer *tern_out_counter_stg;
+  ID3D11Buffer *tern_dec_yuvd_buf[2];
+  ID3D11ShaderResourceView *tern_dec_yuvd_srv[2];
+  ID3D11UnorderedAccessView *tern_dec_yuvd_uav[2];
+  ID3D11Buffer *tern_dec_mvs_buf;
+  ID3D11ShaderResourceView *tern_dec_mvs_srv;
+  ID3D11Buffer *tern_in_records_buf;
+  ID3D11ShaderResourceView *tern_in_records_srv;
+  ID3D11Texture2D *tern_dec_tex;
+  ID3D11UnorderedAccessView *tern_dec_uav;
+  ID3D11Buffer *tern_enc_cb;
+  ID3D11Buffer *tern_dec_cb;
 };
 
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -191,7 +240,18 @@ static int create_d3d11_and_swapchain(gpu_pipeline_t *p, bool show_window,
       IDXGIOutput1 *out1 = NULL;
       if (SUCCEEDED(IDXGIOutput_QueryInterface(out, &IID_IDXGIOutput1, (void **)&out1))) {
         if (SUCCEEDED(IDXGIOutput1_DuplicateOutput(out1, (IUnknown *)p->dev, &p->dupl))) {
-          p->using_desktop_dup = true;
+          /* Frames are copied 1:1 into cap_bgra_tex: only usable when the
+           * desktop has exactly the requested size and a BGRA8 format. */
+          DXGI_OUTDUPL_DESC dd;
+          memset(&dd, 0, sizeof(dd));
+          IDXGIOutputDuplication_GetDesc(p->dupl, &dd);
+          if (dd.ModeDesc.Width == p->width && dd.ModeDesc.Height == p->height &&
+              dd.ModeDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM) {
+            p->using_desktop_dup = true;
+          } else {
+            IDXGIOutputDuplication_Release(p->dupl);
+            p->dupl = NULL;
+          }
         }
         IDXGIOutput1_Release(out1);
       }
@@ -251,6 +311,7 @@ static int create_d3d11_and_swapchain(gpu_pipeline_t *p, bool show_window,
   if (FAILED(hr)) return -5;
 
   /* Setup D3D11 VideoProcessor for zero-copy VRAM BGRA <-> NV12 conversion */
+  (void)ID3D11DeviceContext_QueryInterface(p->ctx, &IID_ID3D11DeviceContext1, (void **)&p->ctx1);
   hr = ID3D11Device_QueryInterface(p->dev, &IID_ID3D11VideoDevice, (void **)&p->vdev);
   if (FAILED(hr)) return -6;
   hr = ID3D11DeviceContext_QueryInterface(p->ctx, &IID_ID3D11VideoContext, (void **)&p->vctx);
@@ -599,8 +660,389 @@ int gpu_pipeline_create(gpu_pipeline_t **out_pipe, uint32_t width,
   return 0;
 }
 
+typedef struct {
+  uint32_t width;
+  uint32_t height;
+  uint32_t threshold;
+  uint32_t delta_min;
+  uint32_t delta_max;
+  uint32_t gamma_q8;
+  uint32_t neutral_y;
+  uint32_t total_blocks;
+  uint32_t frame_id;
+  uint32_t intra_cycles;
+  uint32_t intra_err_thr;
+  uint32_t tiles_x;
+  uint32_t tiles_y;
+  uint32_t search_r;
+  uint32_t max_record_words;
+  uint32_t mode_flags;
+} tern_enc_cb_t;
+
+typedef struct {
+  uint32_t width;
+  uint32_t height;
+  uint32_t delta_min;
+  uint32_t delta_max;
+  uint32_t gamma_q8;
+  uint32_t neutral_y;
+  uint32_t record_words;
+  uint32_t tiles_x;
+} tern_dec_cb_t;
+
+static int compile_hlsl_cs(ID3D11Device *dev, const char *filename,
+                           const char *entry, ID3D11ComputeShader **out_cs) {
+  const char *prefixes[4] = {
+#ifdef TERN_VID_SHADERS_DIR
+    TERN_VID_SHADERS_DIR "/",
+#else
+    "../tern_vid/shaders/",
+#endif
+    "../tern_vid/shaders/",
+    "../../tern_vid/shaders/",
+    "shaders/"
+  };
+  ID3DBlob *code = NULL;
+  ID3DBlob *err = NULL;
+  HRESULT hr = E_FAIL;
+
+  for (int i = 0; i < 4; ++i) {
+    char path[MAX_PATH];
+    wchar_t wpath[MAX_PATH];
+    snprintf(path, sizeof(path), "%s%s", prefixes[i], filename);
+    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) continue;
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH);
+    hr = D3DCompileFromFile(wpath, NULL, D3D_COMPILE_STANDARD_FILE_INCLUDE,
+                            entry, "cs_5_0",
+                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
+    if (SUCCEEDED(hr)) break;
+    if (err) {
+      fprintf(stderr, "HLSL compile error (%s:%s): %s\n",
+              path, entry, (const char *)ID3D10Blob_GetBufferPointer(err));
+      ID3D10Blob_Release(err);
+      err = NULL;
+    }
+  }
+  if (err) ID3D10Blob_Release(err);
+  if (FAILED(hr) || !code) return -1;
+
+  hr = ID3D11Device_CreateComputeShader(
+      dev, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code),
+      NULL, out_cs);
+  ID3D10Blob_Release(code);
+  return SUCCEEDED(hr) ? 0 : -2;
+}
+
+static int create_yuvd_pingpong(ID3D11Device *dev, size_t num_px,
+                                uint32_t neutral_y, uint32_t delta_min,
+                                ID3D11Buffer *bufs[2],
+                                ID3D11ShaderResourceView *srvs[2],
+                                ID3D11UnorderedAccessView *uavs[2]) {
+  uint32_t init_w = (neutral_y & 0xFFU) | (128U << 8) | (128U << 16) | ((delta_min & 0xFFU) << 24);
+  uint32_t *init_data = (uint32_t *)malloc(num_px * sizeof(uint32_t));
+  if (!init_data) return -1;
+  for (size_t i = 0; i < num_px; ++i) init_data[i] = init_w;
+
+  D3D11_BUFFER_DESC bd = {0};
+  bd.ByteWidth = (UINT)(num_px * sizeof(uint32_t));
+  bd.Usage = D3D11_USAGE_DEFAULT;
+  bd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+  bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+  bd.StructureByteStride = sizeof(uint32_t);
+
+  D3D11_SUBRESOURCE_DATA sd = {0};
+  sd.pSysMem = init_data;
+
+  D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {0};
+  srvd.Format = DXGI_FORMAT_UNKNOWN;
+  srvd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+  srvd.Buffer.NumElements = (UINT)num_px;
+
+  D3D11_UNORDERED_ACCESS_VIEW_DESC uavd = {0};
+  uavd.Format = DXGI_FORMAT_UNKNOWN;
+  uavd.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+  uavd.Buffer.NumElements = (UINT)num_px;
+
+  int rc = 0;
+  for (int i = 0; i < 2; ++i) {
+    if (FAILED(ID3D11Device_CreateBuffer(dev, &bd, &sd, &bufs[i])) ||
+        FAILED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)bufs[i], &srvd, &srvs[i])) ||
+        FAILED(ID3D11Device_CreateUnorderedAccessView(dev, (ID3D11Resource *)bufs[i], &uavd, &uavs[i]))) {
+      rc = -1;
+      break;
+    }
+  }
+  free(init_data);
+  return rc;
+}
+
+static int setup_ternary_hlsl(gpu_pipeline_t *p, gpu_pipeline_info_t *info) {
+  if (compile_hlsl_cs(p->dev, "ternary_encode.hlsl", "CSTileMV", &p->tern_cs_tile_mv) != 0)
+    return -19;
+  if (compile_hlsl_cs(p->dev, "ternary_encode.hlsl", "CSEncode", &p->tern_cs_encode) != 0)
+    return -20;
+  if (compile_hlsl_cs(p->dev, "ternary_decode.hlsl", "CSMotionDecay", &p->tern_cs_motion_decay) != 0)
+    return -21;
+  if (compile_hlsl_cs(p->dev, "ternary_decode.hlsl", "CSApply", &p->tern_cs_apply) != 0)
+    return -22;
+  if (compile_hlsl_cs(p->dev, "ternary_decode.hlsl", "CSYCbCrToRGBA", &p->tern_cs_ycbcr_to_rgba) != 0)
+    return -22;
+
+  HRESULT hr = ID3D11Device_CreateShaderResourceView(
+      p->dev, (ID3D11Resource *)p->cap_bgra_tex, NULL, &p->cap_bgra_srv);
+  if (FAILED(hr)) return -23;
+
+  size_t num_px = (size_t)p->width * (size_t)p->height;
+  p->tern_total_blocks = (uint32_t)((num_px + 9U) / 10U);
+  p->tern_tiles_x = (p->width + 31U) / 32U;
+  p->tern_tiles_y = (p->height + 31U) / 32U;
+  uint32_t num_tiles = p->tern_tiles_x * p->tern_tiles_y;
+  p->tern_max_record_words = (uint32_t)(2U * num_px + (size_t)p->tern_total_blocks * 6U);
+
+  if (create_yuvd_pingpong(p->dev, num_px, p->tern_neutral_y, p->tern_delta_min,
+                           p->tern_enc_yuvd_buf, p->tern_enc_yuvd_srv,
+                           p->tern_enc_yuvd_uav) != 0) {
+    return -24;
+  }
+  if (create_yuvd_pingpong(p->dev, num_px, p->tern_neutral_y, p->tern_delta_min,
+                           p->tern_dec_yuvd_buf, p->tern_dec_yuvd_srv,
+                           p->tern_dec_yuvd_uav) != 0) {
+    return -24;
+  }
+
+  /* Tile MV buffers (enc UAV + staging, dec DYNAMIC SRV) */
+  D3D11_BUFFER_DESC bd = {0};
+  bd.ByteWidth = num_tiles * 8U;
+  bd.Usage = D3D11_USAGE_DEFAULT;
+  bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+  bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+  bd.StructureByteStride = 8U;
+  hr = ID3D11Device_CreateBuffer(p->dev, &bd, NULL, &p->tern_enc_mvs_buf);
+  if (FAILED(hr)) return -24;
+
+  D3D11_UNORDERED_ACCESS_VIEW_DESC uavd = {0};
+  uavd.Format = DXGI_FORMAT_UNKNOWN;
+  uavd.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+  uavd.Buffer.NumElements = num_tiles;
+  hr = ID3D11Device_CreateUnorderedAccessView(
+      p->dev, (ID3D11Resource *)p->tern_enc_mvs_buf, &uavd, &p->tern_enc_mvs_uav);
+  if (FAILED(hr)) return -24;
+
+  memset(&bd, 0, sizeof(bd));
+  bd.ByteWidth = num_tiles * 8U;
+  bd.Usage = D3D11_USAGE_STAGING;
+  bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  hr = ID3D11Device_CreateBuffer(p->dev, &bd, NULL, &p->tern_enc_mvs_stg);
+  if (FAILED(hr)) return -24;
+
+  memset(&bd, 0, sizeof(bd));
+  bd.ByteWidth = num_tiles * 8U;
+  bd.Usage = D3D11_USAGE_DYNAMIC;
+  bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+  bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+  bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+  bd.StructureByteStride = 8U;
+  hr = ID3D11Device_CreateBuffer(p->dev, &bd, NULL, &p->tern_dec_mvs_buf);
+  if (FAILED(hr)) return -24;
+
+  D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {0};
+  srvd.Format = DXGI_FORMAT_UNKNOWN;
+  srvd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+  srvd.Buffer.NumElements = num_tiles;
+  hr = ID3D11Device_CreateShaderResourceView(
+      p->dev, (ID3D11Resource *)p->tern_dec_mvs_buf, &srvd, &p->tern_dec_mvs_srv);
+  if (FAILED(hr)) return -24;
+
+  /* Output active records buffer + staging (worst-case Intra + Delta) */
+  UINT rec_bytes = p->tern_max_record_words * (UINT)sizeof(uint32_t);
+  memset(&bd, 0, sizeof(bd));
+  bd.ByteWidth = rec_bytes;
+  bd.Usage = D3D11_USAGE_DEFAULT;
+  bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+  bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+  bd.StructureByteStride = sizeof(uint32_t);
+  hr = ID3D11Device_CreateBuffer(p->dev, &bd, NULL, &p->tern_out_records_buf);
+  if (FAILED(hr)) return -25;
+
+  memset(&uavd, 0, sizeof(uavd));
+  uavd.Format = DXGI_FORMAT_UNKNOWN;
+  uavd.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+  uavd.Buffer.NumElements = p->tern_max_record_words;
+  hr = ID3D11Device_CreateUnorderedAccessView(
+      p->dev, (ID3D11Resource *)p->tern_out_records_buf, &uavd, &p->tern_out_records_uav);
+  if (FAILED(hr)) return -25;
+
+  memset(&bd, 0, sizeof(bd));
+  bd.ByteWidth = rec_bytes;
+  bd.Usage = D3D11_USAGE_STAGING;
+  bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  hr = ID3D11Device_CreateBuffer(p->dev, &bd, NULL, &p->tern_out_records_stg);
+  if (FAILED(hr)) return -25;
+
+  /* Atomic counter buffer (4 bytes) + staging */
+  memset(&bd, 0, sizeof(bd));
+  bd.ByteWidth = 4U;
+  bd.Usage = D3D11_USAGE_DEFAULT;
+  bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+  bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+  hr = ID3D11Device_CreateBuffer(p->dev, &bd, NULL, &p->tern_out_counter_buf);
+  if (FAILED(hr)) return -26;
+
+  memset(&uavd, 0, sizeof(uavd));
+  uavd.Format = DXGI_FORMAT_R32_TYPELESS;
+  uavd.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+  uavd.Buffer.NumElements = 1U;
+  uavd.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+  hr = ID3D11Device_CreateUnorderedAccessView(
+      p->dev, (ID3D11Resource *)p->tern_out_counter_buf, &uavd, &p->tern_out_counter_uav);
+  if (FAILED(hr)) return -26;
+
+  memset(&bd, 0, sizeof(bd));
+  bd.ByteWidth = 4U;
+  bd.Usage = D3D11_USAGE_STAGING;
+  bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  hr = ID3D11Device_CreateBuffer(p->dev, &bd, NULL, &p->tern_out_counter_stg);
+  if (FAILED(hr)) return -26;
+
+  /* Decoder input records (DYNAMIC) + SRV */
+  memset(&bd, 0, sizeof(bd));
+  bd.ByteWidth = rec_bytes;
+  bd.Usage = D3D11_USAGE_DYNAMIC;
+  bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+  bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+  bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+  bd.StructureByteStride = sizeof(uint32_t);
+  hr = ID3D11Device_CreateBuffer(p->dev, &bd, NULL, &p->tern_in_records_buf);
+  if (FAILED(hr)) return -27;
+
+  memset(&srvd, 0, sizeof(srvd));
+  srvd.Format = DXGI_FORMAT_UNKNOWN;
+  srvd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+  srvd.Buffer.NumElements = p->tern_max_record_words;
+  hr = ID3D11Device_CreateShaderResourceView(
+      p->dev, (ID3D11Resource *)p->tern_in_records_buf, &srvd, &p->tern_in_records_srv);
+  if (FAILED(hr)) return -27;
+
+  /* Decoder output texture in VRAM */
+  UINT fmt_sup = 0;
+  ID3D11Device_CheckFormatSupport(p->dev, DXGI_FORMAT_B8G8R8A8_UNORM, &fmt_sup);
+  DXGI_FORMAT dec_fmt = (fmt_sup & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW)
+      ? DXGI_FORMAT_B8G8R8A8_UNORM
+      : DXGI_FORMAT_R8G8B8A8_UNORM;
+  p->tern_dec_use_copy = (dec_fmt == DXGI_FORMAT_B8G8R8A8_UNORM);
+
+  D3D11_TEXTURE2D_DESC td = {0};
+  td.Width = p->width;
+  td.Height = p->height;
+  td.MipLevels = 1;
+  td.ArraySize = 1;
+  td.Format = dec_fmt;
+  td.SampleDesc.Count = 1;
+  td.Usage = D3D11_USAGE_DEFAULT;
+  td.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+  hr = ID3D11Device_CreateTexture2D(p->dev, &td, NULL, &p->tern_dec_tex);
+  if (FAILED(hr)) return -28;
+
+  hr = ID3D11Device_CreateUnorderedAccessView(
+      p->dev, (ID3D11Resource *)p->tern_dec_tex, NULL, &p->tern_dec_uav);
+  if (FAILED(hr)) return -28;
+
+  /* Constant buffers */
+  memset(&bd, 0, sizeof(bd));
+  bd.ByteWidth = sizeof(tern_enc_cb_t);
+  bd.Usage = D3D11_USAGE_DEFAULT;
+  bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+  hr = ID3D11Device_CreateBuffer(p->dev, &bd, NULL, &p->tern_enc_cb);
+  if (FAILED(hr)) return -29;
+
+  bd.ByteWidth = sizeof(tern_dec_cb_t);
+  hr = ID3D11Device_CreateBuffer(p->dev, &bd, NULL, &p->tern_dec_cb);
+  if (FAILED(hr)) return -29;
+
+  free(p->enc_out_buf);
+  p->enc_out_cap = 8U + (size_t)num_tiles * 8U + (size_t)rec_bytes;
+  p->enc_out_buf = (uint8_t *)malloc(p->enc_out_cap);
+  if (!p->enc_out_buf) return -30;
+
+  snprintf(info->encoder_name, sizeof(info->encoder_name),
+           "Ternary YCbCr+TileMV HLSL (cs_5_0)");
+  snprintf(info->decoder_name, sizeof(info->decoder_name),
+           "Ternary YCbCr+TileMV HLSL (cs_5_0)");
+  return 0;
+}
+
+int gpu_pipeline_create_ternary(gpu_pipeline_t **out_pipe, uint32_t width,
+                                uint32_t height, uint32_t fps,
+                                uint32_t threshold, uint32_t delta_step,
+                                uint32_t gamma_q8, uint32_t neutral_y,
+                                bool show_window, gpu_pipeline_info_t *out_info) {
+  gpu_pipeline_t *p = (gpu_pipeline_t *)calloc(1, sizeof(*p));
+  if (!p) return -1;
+
+  p->width = width;
+  p->height = height;
+  p->fps = fps;
+  p->use_ternary = true;
+  p->tern_threshold = threshold;
+  p->tern_delta_min = delta_step;
+  p->tern_delta_max = 32U;
+  p->tern_gamma_q8 = gamma_q8;
+  p->tern_neutral_y = neutral_y;
+
+  gpu_pipeline_info_t info;
+  memset(&info, 0, sizeof(info));
+  info.width = width;
+  info.height = height;
+
+  int rc = create_d3d11_and_swapchain(p, show_window, &info);
+  if (rc != 0) {
+    gpu_pipeline_destroy(p);
+    return rc;
+  }
+  rc = setup_ternary_hlsl(p, &info);
+  if (rc != 0) {
+    gpu_pipeline_destroy(p);
+    return rc;
+  }
+
+  if (out_info) *out_info = info;
+  *out_pipe = p;
+  return 0;
+}
+
 void gpu_pipeline_destroy(gpu_pipeline_t *p) {
   if (!p) return;
+  if (p->tern_dec_cb) ID3D11Buffer_Release(p->tern_dec_cb);
+  if (p->tern_enc_cb) ID3D11Buffer_Release(p->tern_enc_cb);
+  if (p->tern_dec_uav) ID3D11UnorderedAccessView_Release(p->tern_dec_uav);
+  if (p->tern_dec_tex) ID3D11Texture2D_Release(p->tern_dec_tex);
+  if (p->tern_in_records_srv) ID3D11ShaderResourceView_Release(p->tern_in_records_srv);
+  if (p->tern_in_records_buf) ID3D11Buffer_Release(p->tern_in_records_buf);
+  if (p->tern_dec_mvs_srv) ID3D11ShaderResourceView_Release(p->tern_dec_mvs_srv);
+  if (p->tern_dec_mvs_buf) ID3D11Buffer_Release(p->tern_dec_mvs_buf);
+  for (int i = 0; i < 2; ++i) {
+    if (p->tern_dec_yuvd_uav[i]) ID3D11UnorderedAccessView_Release(p->tern_dec_yuvd_uav[i]);
+    if (p->tern_dec_yuvd_srv[i]) ID3D11ShaderResourceView_Release(p->tern_dec_yuvd_srv[i]);
+    if (p->tern_dec_yuvd_buf[i]) ID3D11Buffer_Release(p->tern_dec_yuvd_buf[i]);
+    if (p->tern_enc_yuvd_uav[i]) ID3D11UnorderedAccessView_Release(p->tern_enc_yuvd_uav[i]);
+    if (p->tern_enc_yuvd_srv[i]) ID3D11ShaderResourceView_Release(p->tern_enc_yuvd_srv[i]);
+    if (p->tern_enc_yuvd_buf[i]) ID3D11Buffer_Release(p->tern_enc_yuvd_buf[i]);
+  }
+  if (p->tern_out_counter_stg) ID3D11Buffer_Release(p->tern_out_counter_stg);
+  if (p->tern_out_counter_uav) ID3D11UnorderedAccessView_Release(p->tern_out_counter_uav);
+  if (p->tern_out_counter_buf) ID3D11Buffer_Release(p->tern_out_counter_buf);
+  if (p->tern_out_records_stg) ID3D11Buffer_Release(p->tern_out_records_stg);
+  if (p->tern_out_records_uav) ID3D11UnorderedAccessView_Release(p->tern_out_records_uav);
+  if (p->tern_out_records_buf) ID3D11Buffer_Release(p->tern_out_records_buf);
+  if (p->tern_enc_mvs_stg) ID3D11Buffer_Release(p->tern_enc_mvs_stg);
+  if (p->tern_enc_mvs_uav) ID3D11UnorderedAccessView_Release(p->tern_enc_mvs_uav);
+  if (p->tern_enc_mvs_buf) ID3D11Buffer_Release(p->tern_enc_mvs_buf);
+  if (p->cap_bgra_srv) ID3D11ShaderResourceView_Release(p->cap_bgra_srv);
+  if (p->tern_cs_ycbcr_to_rgba) ID3D11ComputeShader_Release(p->tern_cs_ycbcr_to_rgba);
+  if (p->tern_cs_apply) ID3D11ComputeShader_Release(p->tern_cs_apply);
+  if (p->tern_cs_motion_decay) ID3D11ComputeShader_Release(p->tern_cs_motion_decay);
+  if (p->tern_cs_encode) ID3D11ComputeShader_Release(p->tern_cs_encode);
+  if (p->tern_cs_tile_mv) ID3D11ComputeShader_Release(p->tern_cs_tile_mv);
   if (p->use_direct_nvenc && p->nvenc_session) {
     if (p->nvenc_bitstream) p->nvenc_fn.nvEncDestroyBitstreamBuffer(p->nvenc_session, p->nvenc_bitstream);
     if (p->nvenc_reg_res) p->nvenc_fn.nvEncUnregisterResource(p->nvenc_session, p->nvenc_reg_res);
@@ -620,6 +1062,7 @@ void gpu_pipeline_destroy(gpu_pipeline_t *p) {
   if (p->cap_rtv) ID3D11RenderTargetView_Release(p->cap_rtv);
   if (p->cap_bgra_tex) ID3D11Texture2D_Release(p->cap_bgra_tex);
   if (p->swapchain) IDXGISwapChain1_Release(p->swapchain);
+  if (p->ctx1) ID3D11DeviceContext1_Release(p->ctx1);
   if (p->ctx) ID3D11DeviceContext_Release(p->ctx);
   if (p->dev) ID3D11Device_Release(p->dev);
   if (p->hwnd) DestroyWindow(p->hwnd);
@@ -678,20 +1121,52 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
         ID3D11DeviceContext_CopyResource(p->ctx, (ID3D11Resource *)p->cap_bgra_tex,
                                          (ID3D11Resource *)dupl_tex);
         ID3D11Texture2D_Release(dupl_tex);
+        p->dupl_has_frame = true;
       }
       acquired_dupl = true;
     } else if (hr != DXGI_ERROR_WAIT_TIMEOUT) {
-      /* Fallback to GPU-rendered pattern */
+      /* Access lost (mode switch, secure desktop...): stop duplicating and
+       * fall back to the GPU-rendered pattern from now on. */
+      IDXGIOutputDuplication_Release(p->dupl);
+      p->dupl = NULL;
+      p->dupl_has_frame = false;
+      p->fallback_bg_init = false;
     }
   }
 
-  if (!acquired_dupl) {
-    float c = (float)(frame_idx % 120U) / 120.0f;
-    float rgba[4] = {0.1f + 0.7f * c, 0.25f, 0.85f - 0.6f * c, 1.0f};
-    ID3D11DeviceContext_ClearRenderTargetView(p->ctx, p->cap_rtv, rgba);
+  /* A timeout only means the desktop did not change: the previous capture is
+   * still the current picture, so do not paint the test pattern over it. */
+  if (!acquired_dupl && !p->dupl_has_frame) {
+    if (p->ctx1) {
+      float bg[4] = {0.10f, 0.12f, 0.16f, 1.0f};
+      float hud[4] = {0.88f, 0.90f, 0.94f, 1.0f};
+      float box_col[4] = {0.25f, 0.65f, 0.92f, 1.0f};
+      if (!p->fallback_bg_init) {
+        ID3D11DeviceContext_ClearRenderTargetView(p->ctx, p->cap_rtv, bg);
+        p->fallback_bg_init = true;
+      } else if (frame_idx > 0) {
+        uint32_t prev_x = ((frame_idx - 1U) * 4U) % (p->width > 340U ? p->width - 340U : 1U);
+        D3D11_RECT erase_r = {(LONG)prev_x, (LONG)(p->height / 3U),
+                              (LONG)(prev_x + 320U), (LONG)(p->height / 3U + 200U)};
+        ID3D11DeviceContext1_ClearView(p->ctx1, (ID3D11View *)p->cap_rtv, bg, &erase_r, 1);
+      }
+      uint32_t cur_x = (frame_idx * 4U) % (p->width > 340U ? p->width - 340U : 1U);
+      D3D11_RECT sprite_r = {(LONG)cur_x, (LONG)(p->height / 3U),
+                             (LONG)(cur_x + 320U), (LONG)(p->height / 3U + 200U)};
+      ID3D11DeviceContext1_ClearView(p->ctx1, (ID3D11View *)p->cap_rtv, box_col, &sprite_r, 1);
+
+      D3D11_RECT hud_r = {40, (LONG)(p->height - 100U),
+                          (LONG)(p->width > 560U ? 520U : p->width - 20U),
+                          (LONG)(p->height - 40U)};
+      ID3D11DeviceContext1_ClearView(p->ctx1, (ID3D11View *)p->cap_rtv, hud, &hud_r, 1);
+    } else {
+      float c = (float)(frame_idx % 120U) / 120.0f;
+      float rgba[4] = {0.1f + 0.7f * c, 0.25f, 0.85f - 0.6f * c, 1.0f};
+      ID3D11DeviceContext_ClearRenderTargetView(p->ctx, p->cap_rtv, rgba);
+    }
   }
 
-  if (!p->use_direct_nvenc) {
+  if (!p->use_direct_nvenc && !p->use_ternary) {
     /* Zero-copy GPU BGRA -> NV12 conversion in VRAM (MFT fallback only) */
     vp_blit_textures(p, src_bgra, p->enc_nv12_tex);
   }
@@ -702,6 +1177,93 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
   }
 
   QueryPerformanceCounter(&t1);
+
+  if (p->use_ternary) {
+    uint32_t ping = p->tern_enc_ping & 1U;
+    uint32_t pong = ping ^ 1U;
+    p->tern_enc_ping = pong;
+
+    UINT zero4[4] = {0, 0, 0, 0};
+    ID3D11DeviceContext_ClearUnorderedAccessViewUint(p->ctx, p->tern_out_counter_uav, zero4);
+
+    tern_enc_cb_t ecb = {
+        p->width, p->height, p->tern_threshold, p->tern_delta_min,
+        p->tern_delta_max, p->tern_gamma_q8, p->tern_neutral_y, p->tern_total_blocks,
+        frame_idx, 120U, (frame_idx == 0) ? 255U : 32U, p->tern_tiles_x, p->tern_tiles_y,
+        6U, 15000U, 0U
+    };
+    ID3D11DeviceContext_UpdateSubresource(p->ctx, (ID3D11Resource *)p->tern_enc_cb,
+                                          0, NULL, &ecb, 0, 0);
+
+    ID3D11ShaderResourceView *srvs[2] = {p->cap_bgra_srv, p->tern_enc_yuvd_srv[ping]};
+    ID3D11UnorderedAccessView *uavs[4] = {
+        p->tern_enc_yuvd_uav[pong], p->tern_enc_mvs_uav,
+        p->tern_out_records_uav, p->tern_out_counter_uav
+    };
+    ID3D11DeviceContext_CSSetConstantBuffers(p->ctx, 0, 1, &p->tern_enc_cb);
+    ID3D11DeviceContext_CSSetShaderResources(p->ctx, 0, 2, srvs);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(p->ctx, 0, 4, uavs, NULL);
+
+    /* Pass 1: CSTileMV (32x32 tiles) */
+    ID3D11DeviceContext_CSSetShader(p->ctx, p->tern_cs_tile_mv, NULL, 0);
+    ID3D11DeviceContext_Dispatch(p->ctx, p->tern_tiles_x, p->tern_tiles_y, 1);
+
+    /* Pass 2: CSEncode (YCbCr + ADM + Rolling Intra-Refresh) */
+    ID3D11DeviceContext_CSSetShader(p->ctx, p->tern_cs_encode, NULL, 0);
+    ID3D11DeviceContext_Dispatch(p->ctx, (p->tern_total_blocks + 63U) / 64U, 1, 1);
+
+    ID3D11ShaderResourceView *null_srv[2] = {NULL, NULL};
+    ID3D11UnorderedAccessView *null_uav[4] = {NULL, NULL, NULL, NULL};
+    ID3D11DeviceContext_CSSetShaderResources(p->ctx, 0, 2, null_srv);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(p->ctx, 0, 4, null_uav, NULL);
+
+    ID3D11DeviceContext_CopyResource(p->ctx, (ID3D11Resource *)p->tern_out_counter_stg,
+                                     (ID3D11Resource *)p->tern_out_counter_buf);
+    ID3D11DeviceContext_CopyResource(p->ctx, (ID3D11Resource *)p->tern_enc_mvs_stg,
+                                     (ID3D11Resource *)p->tern_enc_mvs_buf);
+
+    D3D11_MAPPED_SUBRESOURCE mr = {0};
+    uint32_t record_words = 0;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(p->ctx, (ID3D11Resource *)p->tern_out_counter_stg,
+                                          0, D3D11_MAP_READ, 0, &mr))) {
+      record_words = *(const uint32_t *)mr.pData;
+      ID3D11DeviceContext_Unmap(p->ctx, (ID3D11Resource *)p->tern_out_counter_stg, 0);
+    }
+    if (record_words > p->tern_max_record_words) record_words = p->tern_max_record_words;
+
+    uint32_t mv_bytes = p->tern_tiles_x * p->tern_tiles_y * 8U;
+    memcpy(p->enc_out_buf, &record_words, sizeof(uint32_t));
+    memcpy(p->enc_out_buf + sizeof(uint32_t), &mv_bytes, sizeof(uint32_t));
+
+    if (SUCCEEDED(ID3D11DeviceContext_Map(p->ctx, (ID3D11Resource *)p->tern_enc_mvs_stg,
+                                          0, D3D11_MAP_READ, 0, &mr))) {
+      memcpy(p->enc_out_buf + 8U, mr.pData, mv_bytes);
+      ID3D11DeviceContext_Unmap(p->ctx, (ID3D11Resource *)p->tern_enc_mvs_stg, 0);
+    }
+
+    size_t out_bytes = 8U + mv_bytes;
+    if (record_words > 0) {
+      D3D11_BOX box = {0, 0, 0, record_words * (UINT)sizeof(uint32_t), 1, 1};
+      ID3D11DeviceContext_CopySubresourceRegion(
+          p->ctx, (ID3D11Resource *)p->tern_out_records_stg, 0, 0, 0, 0,
+          (ID3D11Resource *)p->tern_out_records_buf, 0, &box);
+      if (SUCCEEDED(ID3D11DeviceContext_Map(p->ctx, (ID3D11Resource *)p->tern_out_records_stg,
+                                            0, D3D11_MAP_READ, 0, &mr))) {
+        size_t rec_bytes = (size_t)record_words * sizeof(uint32_t);
+        memcpy(p->enc_out_buf + out_bytes, mr.pData, rec_bytes);
+        out_bytes += rec_bytes;
+        ID3D11DeviceContext_Unmap(p->ctx, (ID3D11Resource *)p->tern_out_records_stg, 0);
+      }
+    }
+
+    QueryPerformanceCounter(&t2);
+    if (out_cap_us) *out_cap_us = qpc_delta_us(t0, t1);
+    if (out_enc_us) *out_enc_us = qpc_delta_us(t1, t2);
+    if (out_bitstream) *out_bitstream = p->enc_out_buf;
+    if (out_len) *out_len = out_bytes;
+    if (out_keyframe) *out_keyframe = (frame_idx == 0);
+    return 0;
+  }
 
   if (p->use_direct_nvenc) {
     NV_ENC_MAP_INPUT_RESOURCE map = {0};
@@ -872,6 +1434,93 @@ int gpu_pipeline_decode_and_present(gpu_pipeline_t *p,
   LARGE_INTEGER t0, t1, t2;
   QueryPerformanceCounter(&t0);
 
+  if (p->use_ternary) {
+    if (len < 8U) return -1;
+    uint32_t record_words = 0, mv_bytes = 0;
+    memcpy(&record_words, bitstream, sizeof(uint32_t));
+    memcpy(&mv_bytes, bitstream + sizeof(uint32_t), sizeof(uint32_t));
+    if (record_words > p->tern_max_record_words) record_words = p->tern_max_record_words;
+    if (len < 8U + (size_t)mv_bytes + (size_t)record_words * sizeof(uint32_t)) return -1;
+
+    D3D11_MAPPED_SUBRESOURCE mw = {0};
+    if (mv_bytes > 0 &&
+        SUCCEEDED(ID3D11DeviceContext_Map(p->ctx, (ID3D11Resource *)p->tern_dec_mvs_buf,
+                                          0, D3D11_MAP_WRITE_DISCARD, 0, &mw))) {
+      memcpy(mw.pData, bitstream + 8U, mv_bytes);
+      ID3D11DeviceContext_Unmap(p->ctx, (ID3D11Resource *)p->tern_dec_mvs_buf, 0);
+    }
+    if (record_words > 0 &&
+        SUCCEEDED(ID3D11DeviceContext_Map(p->ctx, (ID3D11Resource *)p->tern_in_records_buf,
+                                          0, D3D11_MAP_WRITE_DISCARD, 0, &mw))) {
+      memcpy(mw.pData, bitstream + 8U + mv_bytes,
+             (size_t)record_words * sizeof(uint32_t));
+      ID3D11DeviceContext_Unmap(p->ctx, (ID3D11Resource *)p->tern_in_records_buf, 0);
+    }
+
+    uint32_t ping = p->tern_dec_ping & 1U;
+    uint32_t pong = ping ^ 1U;
+    p->tern_dec_ping = pong;
+
+    tern_dec_cb_t dcb = {
+        p->width, p->height, p->tern_delta_min, p->tern_delta_max,
+        p->tern_gamma_q8, p->tern_neutral_y, record_words, p->tern_tiles_x
+    };
+    ID3D11DeviceContext_UpdateSubresource(p->ctx, (ID3D11Resource *)p->tern_dec_cb,
+                                          0, NULL, &dcb, 0, 0);
+
+    ID3D11ShaderResourceView *srvs[3] = {
+        p->tern_dec_mvs_srv, p->tern_in_records_srv, p->tern_dec_yuvd_srv[ping]
+    };
+    ID3D11UnorderedAccessView *uavs[2] = {
+        p->tern_dec_yuvd_uav[pong], p->tern_dec_uav
+    };
+    ID3D11DeviceContext_CSSetConstantBuffers(p->ctx, 0, 1, &p->tern_dec_cb);
+    ID3D11DeviceContext_CSSetShaderResources(p->ctx, 0, 3, srvs);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(p->ctx, 0, 2, uavs, NULL);
+
+    /* Pass 1: CSMotionDecay */
+    ID3D11DeviceContext_CSSetShader(p->ctx, p->tern_cs_motion_decay, NULL, 0);
+    ID3D11DeviceContext_Dispatch(p->ctx, (p->width + 15U) / 16U,
+                                 (p->height + 15U) / 16U, 1);
+
+    /* Pass 2: CSApply */
+    if (record_words >= 2U) {
+      ID3D11DeviceContext_CSSetShader(p->ctx, p->tern_cs_apply, NULL, 0);
+      ID3D11DeviceContext_Dispatch(p->ctx, ((record_words / 2U) + 63U) / 64U, 1, 1);
+    }
+
+    /* Pass 3: CSYCbCrToRGBA */
+    ID3D11DeviceContext_CSSetShader(p->ctx, p->tern_cs_ycbcr_to_rgba, NULL, 0);
+    ID3D11DeviceContext_Dispatch(p->ctx, (p->width + 15U) / 16U,
+                                 (p->height + 15U) / 16U, 1);
+
+    ID3D11ShaderResourceView *null_srv[3] = {NULL, NULL, NULL};
+    ID3D11UnorderedAccessView *null_uav[2] = {NULL, NULL};
+    ID3D11DeviceContext_CSSetShaderResources(p->ctx, 0, 3, null_srv);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(p->ctx, 0, 2, null_uav, NULL);
+
+    QueryPerformanceCounter(&t1);
+
+    ID3D11Texture2D *backbuf = NULL;
+    if (SUCCEEDED(IDXGISwapChain1_GetBuffer(p->swapchain, 0, &IID_ID3D11Texture2D,
+                                            (void **)&backbuf))) {
+      if (p->tern_dec_use_copy) {
+        ID3D11DeviceContext_CopyResource(p->ctx, (ID3D11Resource *)backbuf,
+                                         (ID3D11Resource *)p->tern_dec_tex);
+      } else {
+        vp_blit_textures(p, p->tern_dec_tex, backbuf);
+      }
+      ID3D11Texture2D_Release(backbuf);
+    }
+    UINT present_flags = p->tearing_supported ? DXGI_PRESENT_ALLOW_TEARING : 0;
+    IDXGISwapChain1_Present(p->swapchain, 0, present_flags);
+
+    QueryPerformanceCounter(&t2);
+    if (out_dec_us) *out_dec_us = qpc_delta_us(t0, t1);
+    if (out_present_us) *out_present_us = qpc_delta_us(t1, t2);
+    return 0;
+  }
+
   IMFMediaBuffer *in_buf = NULL;
   MFCreateMemoryBuffer((DWORD)len, &in_buf);
   BYTE *dst = NULL;
@@ -960,4 +1609,118 @@ bool gpu_pipeline_pump_events(gpu_pipeline_t *p) {
     DispatchMessageA(&msg);
   }
   return !p->window_closed;
+}
+
+int gpu_pipeline_ternary_compute_psnr(gpu_pipeline_t *p, double *out_psnr_db) {
+  if (!p || !p->use_ternary || !out_psnr_db) return -1;
+
+  D3D11_TEXTURE2D_DESC td = {0};
+  td.Width = p->width;
+  td.Height = p->height;
+  td.MipLevels = 1;
+  td.ArraySize = 1;
+  td.SampleDesc.Count = 1;
+  td.Usage = D3D11_USAGE_STAGING;
+  td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+  td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  ID3D11Texture2D *stg_src = NULL;
+  if (FAILED(ID3D11Device_CreateTexture2D(p->dev, &td, NULL, &stg_src))) return -2;
+
+  td.Format = p->tern_dec_use_copy ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+  ID3D11Texture2D *stg_dec = NULL;
+  if (FAILED(ID3D11Device_CreateTexture2D(p->dev, &td, NULL, &stg_dec))) {
+    ID3D11Texture2D_Release(stg_src);
+    return -2;
+  }
+
+  ID3D11DeviceContext_CopyResource(p->ctx, (ID3D11Resource *)stg_src,
+                                   (ID3D11Resource *)p->cap_bgra_tex);
+  ID3D11DeviceContext_CopyResource(p->ctx, (ID3D11Resource *)stg_dec,
+                                   (ID3D11Resource *)p->tern_dec_tex);
+
+  D3D11_MAPPED_SUBRESOURCE ms = {0}, md = {0};
+  if (FAILED(ID3D11DeviceContext_Map(p->ctx, (ID3D11Resource *)stg_src, 0, D3D11_MAP_READ, 0, &ms)) ||
+      FAILED(ID3D11DeviceContext_Map(p->ctx, (ID3D11Resource *)stg_dec, 0, D3D11_MAP_READ, 0, &md))) {
+    ID3D11Texture2D_Release(stg_src);
+    ID3D11Texture2D_Release(stg_dec);
+    return -3;
+  }
+
+  double mse = 0.0;
+  for (uint32_t y = 0; y < p->height; ++y) {
+    const uint8_t *srow = (const uint8_t *)ms.pData + (size_t)y * ms.RowPitch;
+    const uint8_t *drow = (const uint8_t *)md.pData + (size_t)y * md.RowPitch;
+    for (uint32_t x = 0; x < p->width; ++x) {
+      /* cap_bgra_tex is BGRA */
+      double b = (double)srow[x * 4U + 0U];
+      double g = (double)srow[x * 4U + 1U];
+      double r = (double)srow[x * 4U + 2U];
+      double sy = 0.299 * r + 0.587 * g + 0.114 * b;
+      double db = (double)drow[x * 4U + (p->tern_dec_use_copy ? 0U : 2U)];
+      double dg = (double)drow[x * 4U + 1U];
+      double dr = (double)drow[x * 4U + (p->tern_dec_use_copy ? 2U : 0U)];
+      double dy = 0.299 * dr + 0.587 * dg + 0.114 * db;
+      double diff = sy - dy;
+      mse += diff * diff;
+    }
+  }
+
+  ID3D11DeviceContext_Unmap(p->ctx, (ID3D11Resource *)stg_src, 0);
+  ID3D11DeviceContext_Unmap(p->ctx, (ID3D11Resource *)stg_dec, 0);
+  ID3D11Texture2D_Release(stg_src);
+  ID3D11Texture2D_Release(stg_dec);
+
+  mse /= (double)((size_t)p->width * (size_t)p->height);
+  *out_psnr_db = (mse < 1e-9) ? 99.0 : (10.0 * log10((255.0 * 255.0) / mse));
+  return 0;
+}
+
+int gpu_pipeline_ternary_ref_mismatch(gpu_pipeline_t *p, uint64_t *out_mismatch_px) {
+  if (!p || !p->use_ternary || !out_mismatch_px) return -1;
+
+  size_t num_px = (size_t)p->width * (size_t)p->height;
+  D3D11_BUFFER_DESC bd = {0};
+  bd.ByteWidth = (UINT)(num_px * sizeof(uint32_t));
+  bd.Usage = D3D11_USAGE_STAGING;
+  bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+  bd.StructureByteStride = sizeof(uint32_t);
+
+  ID3D11Buffer *stg[2] = {NULL, NULL};
+  /* tern_*_ping index the buffers written by the last encode / decode. */
+  ID3D11Buffer *src[2] = {p->tern_enc_yuvd_buf[p->tern_enc_ping & 1U],
+                          p->tern_dec_yuvd_buf[p->tern_dec_ping & 1U]};
+  D3D11_MAPPED_SUBRESOURCE map[2];
+  int mapped = 0;
+  int rc = 0;
+
+  for (int i = 0; i < 2 && rc == 0; ++i) {
+    if (FAILED(ID3D11Device_CreateBuffer(p->dev, &bd, NULL, &stg[i]))) {
+      rc = -2;
+      break;
+    }
+    ID3D11DeviceContext_CopyResource(p->ctx, (ID3D11Resource *)stg[i],
+                                     (ID3D11Resource *)src[i]);
+    if (FAILED(ID3D11DeviceContext_Map(p->ctx, (ID3D11Resource *)stg[i], 0,
+                                       D3D11_MAP_READ, 0, &map[i]))) {
+      rc = -3;
+      break;
+    }
+    mapped++;
+  }
+
+  if (rc == 0) {
+    const uint32_t *enc_ref = (const uint32_t *)map[0].pData;
+    const uint32_t *dec_ref = (const uint32_t *)map[1].pData;
+    uint64_t diff = 0;
+    for (size_t i = 0; i < num_px; ++i) diff += (enc_ref[i] != dec_ref[i]);
+    *out_mismatch_px = diff;
+  }
+
+  for (int i = 0; i < 2; ++i) {
+    if (i < mapped) ID3D11DeviceContext_Unmap(p->ctx, (ID3D11Resource *)stg[i], 0);
+    if (stg[i]) ID3D11Buffer_Release(stg[i]);
+  }
+  return rc;
 }

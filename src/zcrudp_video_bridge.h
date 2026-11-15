@@ -16,7 +16,8 @@ extern "C" {
  * Kept compact (16 bytes) so each UDP datagram stays well within 1500B MTU.
  */
 typedef struct {
-  uint32_t magic;       /* 'ZCV1' = 0x5A435631 */
+  uint16_t magic;       /* 'ZV' = 0x5A56 */
+  uint16_t tail_len;    /* Bytes in the last data fragment (1..ZC_FRAG_MTU) */
   uint32_t frame_id;    /* Monotonic frame index */
   uint16_t frag_idx;    /* 0..total_frags-1, or total_frags + parity_id */
   uint16_t total_frags; /* Number of data fragments in this frame */
@@ -25,12 +26,22 @@ typedef struct {
   uint8_t parity_count; /* Total parity shards generated for this frame */
 } zc_video_hdr_t;
 
-#define ZC_VIDEO_MAGIC 0x5A435631U
+/*
+ * Every data fragment but the last carries exactly ZC_FRAG_MTU bytes; the
+ * last carries tail_len. Repeating tail_len in each header lets the receiver
+ * restore the exact frame length when FEC rebuilds the last fragment.
+ *
+ * FEC: parity 0 is a plain XOR, parities 1..3 are Cauchy rows over GF(2^8).
+ * Data fragments ZC_FEC_COLUMN_PERIOD apart share a coefficient column, so
+ * two losses exactly that far apart in one frame need retransmission.
+ */
+#define ZC_VIDEO_MAGIC 0x5A56U
 #define ZC_VIDEO_FLAG_KEYFRAME 0x01U
 #define ZC_VIDEO_FLAG_PARITY   0x02U
 #define ZC_FRAG_MTU            1200U
-#define ZC_MAX_FRAGS_PER_FRAME 512U
+#define ZC_MAX_FRAGS_PER_FRAME 16384U
 #define ZC_MAX_PARITY_SHARDS   4U
+#define ZC_FEC_COLUMN_PERIOD   239U
 
 typedef struct {
   int loss_pct;        /* Random independent packet drop % (0..100) */
@@ -66,6 +77,8 @@ typedef struct {
   uint64_t packets_reordered_sim;
   uint64_t packets_duplicated_sim;
   uint64_t fec_packets_sent;
+  uint64_t send_errors;   /* OS refused the datagram, or delay queue full */
+  uint32_t impair_rng;    /* xorshift32 state of the impairment simulator */
   /* Optional Winsock RIO batch TX state (host-side OS I/O, outside zcrudp) */
   bool rio_ready;
   void *rio_state;
@@ -75,6 +88,7 @@ typedef struct {
   uint32_t active_frame_id;
   uint32_t last_completed_frame_id;
   uint16_t total_frags;
+  uint16_t tail_len;
   uint16_t received_data_frags;
   uint8_t flags;
   uint8_t parity_received_count;
@@ -85,6 +99,7 @@ typedef struct {
   uint8_t *frame_buf;   /* Caller-owned contiguous output buffer */
   size_t frame_cap;
   uint8_t *parity_buf;  /* ZC_MAX_PARITY_SHARDS * ZC_FRAG_MTU */
+  uint8_t slice_buf[ZC_FRAG_MTU]; /* Last slice from zc_video_rx_feed_slice */
   uint64_t frames_completed;
   uint64_t frames_fec_recovered;
   uint64_t frames_dropped;
@@ -97,6 +112,13 @@ int zc_video_tx_init(zc_video_tx_t *tx, size_t pool_pages,
                      uint32_t initial_bps, uint32_t min_bps,
                      uint32_t max_bps, uint8_t fec_shards,
                      const zc_net_impair_t *impair, uint64_t now_us);
+/**
+ * Switches the transmitter to Winsock Registered I/O on a connected UDP socket
+ * created with WSA_FLAG_REGISTERED_IO. Once enabled every datagram (data, FEC
+ * parity, delayed/impaired packets) goes through RIO: ordinary
+ * sendto/WSASendTo calls fail on such a socket, so the two paths cannot be
+ * mixed. If this returns non-zero, send on a plain socket instead.
+ */
 int zc_video_tx_enable_rio(zc_video_tx_t *tx, uintptr_t connected_udp_sock);
 void zc_video_tx_destroy(zc_video_tx_t *tx);
 
@@ -106,7 +128,10 @@ int zc_video_tx_send_frame(zc_video_tx_t *tx, uintptr_t udp_sock,
                            size_t len, bool is_keyframe, uint64_t now_us,
                            bool apply_impair);
 
-/** Flushes delayed/reordered packets whose delivery timestamp has arrived. */
+/**
+ * Flushes delayed/reordered/duplicated packets whose delivery timestamp has
+ * arrived. Must be polled whenever any impairment is configured.
+ */
 int zc_video_tx_flush_net(zc_video_tx_t *tx, uintptr_t udp_sock,
                           const void *dst_addr, int dst_addr_len,
                           uint64_t now_us);
@@ -117,6 +142,30 @@ void zc_video_rx_destroy(zc_video_rx_t *rx);
 int zc_video_rx_feed(zc_video_rx_t *rx, const uint8_t *pkt, size_t pkt_len,
                      size_t *out_len, uint32_t *out_frame_id,
                      bool *out_keyframe, bool *out_fec_used);
+
+/**
+ * Like zc_video_rx_feed, but delivers single-datagram (total_frags==1, parity==0)
+ * independent ternary slices immediately even if reordered within a frame.
+ * Such slices bypass frame tracking, so duplicated datagrams are delivered
+ * twice: the caller deduplicates if its payload is not idempotent.
+ * On return 1, *out_data points at the payload (a slice buffer or frame_buf),
+ * valid until the next feed call.
+ */
+int zc_video_rx_feed_slice(zc_video_rx_t *rx, const uint8_t *pkt, size_t pkt_len,
+                           const uint8_t **out_data, size_t *out_len,
+                           uint32_t *out_frame_id, bool *out_keyframe,
+                           bool *out_fec_used);
+
+/**
+ * Routes a ternary video packet via zcrudp_ternary_route_packet:
+ *  - ZCRUDP_TERNARY_CHAN_RELIABLE_FEC -> FEC-protected zcrudp TX (INTRA / TILE_MV)
+ *  - ZCRUDP_TERNARY_CHAN_UNRELIABLE_RIO -> direct Winsock RIO / unreliable TX (DELTA / DELTA_2X)
+ */
+int zc_video_tx_send_ternary_packet(zc_video_tx_t *tx, uintptr_t udp_sock,
+                                    const void *dst_addr, int dst_addr_len,
+                                    uint32_t pkt_seq_id, const uint8_t *pkt,
+                                    size_t pkt_len, uint64_t now_us,
+                                    bool apply_impair);
 
 #ifdef __cplusplus
 }

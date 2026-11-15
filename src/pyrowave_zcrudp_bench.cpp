@@ -88,6 +88,15 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[i], "--target-bytes") == 0 && i + 1 < argc) target_frame_bytes = (uint32_t)atoi(argv[++i]);
     else if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) width = atoi(argv[++i]);
     else if (strcmp(argv[i], "--height") == 0 && i + 1 < argc) height = atoi(argv[++i]);
+    else if (strcmp(argv[i], "--loss") == 0 && i + 1 < argc) impair.loss_pct = atoi(argv[++i]);
+    else if (strcmp(argv[i], "--burst") == 0 && i + 2 < argc) {
+      impair.burst_prob_pct = atoi(argv[++i]);
+      impair.burst_len = atoi(argv[++i]);
+    }
+    else if (strcmp(argv[i], "--reorder") == 0 && i + 1 < argc) impair.reorder_pct = atoi(argv[++i]);
+    else if (strcmp(argv[i], "--dup") == 0 && i + 1 < argc) impair.dup_pct = atoi(argv[++i]);
+    else if (strcmp(argv[i], "--owd") == 0 && i + 1 < argc) impair.base_owd_us = (uint32_t)atoi(argv[++i]);
+    else if (strcmp(argv[i], "--jitter") == 0 && i + 1 < argc) impair.jitter_us = (uint32_t)atoi(argv[++i]);
     else if (strcmp(argv[i], "--nasty") == 0) {
       impair.loss_pct = 5;
       impair.burst_prob_pct = 8;
@@ -111,8 +120,13 @@ int main(int argc, char **argv) {
   SOCKET rx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   SOCKET tx_sock = WSASocketA(AF_INET, SOCK_DGRAM, IPPROTO_UDP, nullptr, 0,
                               WSA_FLAG_REGISTERED_IO);
-  if (tx_sock == INVALID_SOCKET) {
+  bool rio_socket = (tx_sock != INVALID_SOCKET);
+  if (!rio_socket) {
     tx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  }
+  if (rx_sock == INVALID_SOCKET || tx_sock == INVALID_SOCKET) {
+    fprintf(stderr, "socket failed: %d\n", WSAGetLastError());
+    return 1;
   }
   int rcvbuf = 4 * 1024 * 1024;
   setsockopt(rx_sock, SOL_SOCKET, SO_RCVBUF, (const char *)&rcvbuf, sizeof(rcvbuf));
@@ -128,7 +142,7 @@ int main(int argc, char **argv) {
   }
   int addr_len = sizeof(bind_addr);
   getsockname(rx_sock, (struct sockaddr *)&bind_addr, &addr_len);
-  connect(tx_sock, (struct sockaddr *)&bind_addr, addr_len);
+  bool tx_connected = connect(tx_sock, (struct sockaddr *)&bind_addr, addr_len) == 0;
   u_long nonblock = 1;
   ioctlsocket(rx_sock, FIONBIO, &nonblock);
 
@@ -218,8 +232,20 @@ int main(int argc, char **argv) {
     fprintf(stderr, "zcrudp bridge init failed\n");
     return 1;
   }
-  if (fec_shards == 0 && zc_video_tx_enable_rio(tx, (uintptr_t)tx_sock) == 0) {
+  /* The bridge sends data, FEC parity and delayed packets through RIO once
+   * enabled. Ordinary WSASendTo calls fail on a WSA_FLAG_REGISTERED_IO
+   * socket, so without RIO the socket is replaced by a plain one. */
+  if (rio_socket && tx_connected &&
+      zc_video_tx_enable_rio(tx, (uintptr_t)tx_sock) == 0) {
     printf("Winsock RIO   : ENABLED (Registered I/O batch submit)\n");
+  } else if (rio_socket) {
+    closesocket(tx_sock);
+    tx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (tx_sock == INVALID_SOCKET) {
+      fprintf(stderr, "socket failed: %d\n", WSAGetLastError());
+      return 1;
+    }
+    setsockopt(tx_sock, SOL_SOCKET, SO_SNDBUF, (const char *)&rcvbuf, sizeof(rcvbuf));
   }
 
   printf("=== Pyrowave (Vulkan Wavelet GPU) + zcrudp::nextgen ===\n");
@@ -237,7 +263,9 @@ int main(int argc, char **argv) {
   bool has_impair = (impair.loss_pct > 0 || impair.burst_prob_pct > 0 ||
                      impair.reorder_pct > 0 || impair.dup_pct > 0 ||
                      impair.base_owd_us > 0 || impair.jitter_us > 0);
-  bool has_delay = (impair.base_owd_us > 0 || impair.jitter_us > 0 || impair.reorder_pct > 0);
+  /* Duplicates also sit in the bridge's delay queue (+200 us). */
+  bool has_delay = (impair.base_owd_us > 0 || impair.jitter_us > 0 ||
+                    impair.reorder_pct > 0 || impair.dup_pct > 0);
   Fence fence;
 
   for (uint32_t f = 0; f < (uint32_t)(num_frames + warmup); ++f) {
@@ -281,7 +309,11 @@ int main(int argc, char **argv) {
     uint32_t rx_fid = 0;
     bool rx_kf = false, rx_fec = false;
     uint64_t t_rx_start = qpc_now_us();
-    uint64_t wait_limit = has_delay ? (uint64_t)(impair.base_owd_us + impair.jitter_us + 8500U) : 500U;
+    /* Loopback delivery is asynchronous: poll until the deadline instead of
+     * giving up on the first empty read. Frames are intra-only, so a late
+     * earlier frame is simply skipped. */
+    uint64_t wait_limit = has_delay ? (uint64_t)(impair.base_owd_us + impair.jitter_us + 8500U) : 2000U;
+    uint64_t drops_before = tx->packets_dropped_sim;
 
     while ((qpc_now_us() - t_rx_start) <= wait_limit) {
       if (has_delay) {
@@ -290,11 +322,12 @@ int main(int argc, char **argv) {
       int rlen = recvfrom(rx_sock, (char *)rx_pkt, sizeof(rx_pkt), 0, nullptr, nullptr);
       if (rlen > 0) {
         if (zc_video_rx_feed(rx, rx_pkt, (size_t)rlen, &rx_len, &rx_fid,
-                             &rx_kf, &rx_fec) == 1) {
+                             &rx_kf, &rx_fec) == 1 && rx_fid == f) {
           got_frame = true;
           break;
         }
-      } else if (!has_delay) {
+      } else if (!has_delay && tx->packets_dropped_sim != drops_before &&
+                 (qpc_now_us() - t_rx_start) > 300U) {
         break;
       }
     }
