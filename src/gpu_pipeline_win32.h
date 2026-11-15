@@ -60,6 +60,8 @@ int gpu_pipeline_ternary_ref_mismatch(gpu_pipeline_t *pipe, uint64_t *out_mismat
 
 void gpu_pipeline_set_bitrate(gpu_pipeline_t *pipe, uint32_t bitrate_bps);
 
+void gpu_pipeline_force_synth(gpu_pipeline_t *pipe, bool enable);
+
 void gpu_pipeline_destroy(gpu_pipeline_t *pipe);
 
 /** Captures (or GPU-renders) one frame in VRAM and encodes it to H.264. */

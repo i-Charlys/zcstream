@@ -1051,6 +1051,16 @@ void gpu_pipeline_set_bitrate(gpu_pipeline_t *p, uint32_t bitrate_bps) {
   p->bitrate_bps = bitrate_bps;
 }
 
+void gpu_pipeline_force_synth(gpu_pipeline_t *p, bool enable) {
+  if (!p) return;
+  if (enable && p->dupl) {
+    IDXGIOutputDuplication_Release(p->dupl);
+    p->dupl = NULL;
+    p->dupl_has_frame = false;
+    p->fallback_bg_init = false;
+  }
+}
+
 void gpu_pipeline_destroy(gpu_pipeline_t *p) {
   if (!p) return;
   if (p->tern_dec_cb) ID3D11Buffer_Release(p->tern_dec_cb);

@@ -66,6 +66,7 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) width = (uint32_t)atoi(argv[++i]);
     else if (strcmp(argv[i], "--height") == 0 && i + 1 < argc) height = (uint32_t)atoi(argv[++i]);
     else if (strcmp(argv[i], "--bitrate") == 0 && i + 1 < argc) bitrate_bps = (uint32_t)atoi(argv[++i]);
+    else if (strcmp(argv[i], "--synth") == 0) gpu_pipeline_force_synth(NULL, true);
   }
 
   timeBeginPeriod(1);
@@ -109,6 +110,9 @@ int main(int argc, char **argv) {
   if (rc != 0) {
     fprintf(stderr, "gpu_pipeline_create failed: %d\n", rc);
     return 1;
+  }
+  for (int i = 1; i < argc; ++i) {
+    if (strcmp(argv[i], "--synth") == 0) gpu_pipeline_force_synth(gpu, true);
   }
 
   printf("=== zcrudp::nextgen + D3D11/DXGI Zero-Copy Video Pipeline ===\n");

@@ -41,11 +41,13 @@ int main(int argc, char **argv) {
   bool show_window = false;
   bool measure_psnr = false;
   bool enable_rio = true;
+  bool force_synth = false;
   zc_net_impair_t impair = {0};
 
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "--live") == 0) show_window = true;
     else if (strcmp(argv[i], "--psnr") == 0) measure_psnr = true;
+    else if (strcmp(argv[i], "--synth") == 0) force_synth = true;
     else if (strcmp(argv[i], "--no-rio") == 0) enable_rio = false;
     else if (strcmp(argv[i], "--no-fec") == 0) fec_shards = 0;
     else if (strcmp(argv[i], "--fec") == 0 && i + 1 < argc) fec_shards = (uint8_t)atoi(argv[++i]);
@@ -131,6 +133,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   gpu_pipeline_set_bitrate(gpu, bitrate_bps);
+  if (force_synth) gpu_pipeline_force_synth(gpu, true);
 
   zc_video_tx_t *tx = (zc_video_tx_t *)calloc(1, sizeof(*tx));
   zc_video_rx_t *rx = (zc_video_rx_t *)calloc(1, sizeof(*rx));
