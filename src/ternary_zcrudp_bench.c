@@ -124,12 +124,13 @@ int main(int argc, char **argv) {
   gpu_pipeline_t *gpu = NULL;
   gpu_pipeline_info_t info;
   int rc = gpu_pipeline_create_ternary(&gpu, width, height, fps,
-                                       6U, 8U, 250U, 128U,
+                                       6U, 4U, 256U, 128U,
                                        show_window, &info);
   if (rc != 0) {
     fprintf(stderr, "gpu_pipeline_create_ternary failed: %d\n", rc);
     return 1;
   }
+  gpu_pipeline_set_bitrate(gpu, bitrate_bps);
 
   zc_video_tx_t *tx = (zc_video_tx_t *)calloc(1, sizeof(*tx));
   zc_video_rx_t *rx = (zc_video_rx_t *)calloc(1, sizeof(*rx));
@@ -294,7 +295,7 @@ int main(int argc, char **argv) {
 
     uint64_t t_rx0 = qpc_now_us();
     uint64_t last_rx_us = t_rx0;
-    uint64_t wait_deadline = t_rx0 + (has_impair ? 20000ULL : 10000ULL);
+    uint64_t wait_deadline = t_rx0 + ((has_impair || keyframe || f < 16U) ? 50000ULL : 10000ULL);
     uint64_t idle_grace_us = has_impair ? 2500ULL : 200ULL;
 
     while (qpc_now_us() < wait_deadline) {

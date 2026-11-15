@@ -17,12 +17,34 @@
 #include <strmif.h>
 #include <codecapi.h>
 #include <initguid.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "gpu_pipeline_win32.h"
 #include "nvEncodeAPI.h"
+
+static FILE *g_gpu_log_file = NULL;
+
+void gpu_pipeline_set_log_file(void *stdio_file) {
+  g_gpu_log_file = (FILE *)stdio_file;
+}
+
+static void gpu_log_err(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(stderr, fmt, ap);
+  va_end(ap);
+  fflush(stderr);
+  if (g_gpu_log_file) {
+    va_list ap2;
+    va_start(ap2, fmt);
+    vfprintf(g_gpu_log_file, fmt, ap2);
+    va_end(ap2);
+    fflush(g_gpu_log_file);
+  }
+}
 
 /* Ensure key MF / CodecAPI GUIDs are defined even on older MinGW headers */
 DEFINE_GUID(ZC_MF_MT_MAJOR_TYPE, 0x48eba18e, 0xf8c9, 0x4687, 0xbf, 0x11, 0x0a, 0x74, 0xc9, 0xf9, 0x6a, 0x8f);
@@ -96,6 +118,7 @@ struct gpu_pipeline_s {
   IMFTransform *enc_mft;
   IMFMediaEventGenerator *enc_ev;
   IMFTransform *dec_mft;
+  uint64_t dec_frame_idx;
 
   /* Direct NVENC (nvEncodeAPI64.dll) Zero-Copy ARGB state */
   bool use_direct_nvenc;
@@ -123,6 +146,9 @@ struct gpu_pipeline_s {
   uint32_t tern_max_record_words;
   uint32_t tern_enc_ping;
   uint32_t tern_dec_ping;
+  uint32_t tern_rc_threshold;
+  uint32_t tern_rc_intra_err_thr;
+  bool tern_rc_2x;
   bool tern_dec_use_copy;
   ID3D11ComputeShader *tern_cs_tile_mv;
   ID3D11ComputeShader *tern_cs_encode;
@@ -392,6 +418,7 @@ static int setup_direct_nvenc(gpu_pipeline_t *p, gpu_pipeline_info_t *info) {
   p->nvenc_config.encodeCodecConfig.h264Config.sliceModeData = 0;
   p->nvenc_config.encodeCodecConfig.h264Config.enableIntraRefresh = 0;
   p->nvenc_config.encodeCodecConfig.h264Config.disableDeblockingFilterIDC = 1;
+  p->nvenc_config.encodeCodecConfig.h264Config.outputAUD = 1;
 
   memset(&p->nvenc_init_params, 0, sizeof(p->nvenc_init_params));
   p->nvenc_init_params.version = NV_ENC_INITIALIZE_PARAMS_VER;
@@ -563,6 +590,12 @@ static int setup_mf_h264_decoder(gpu_pipeline_t *p, gpu_pipeline_info_t *info) {
 
   IMFTransform_ProcessMessage(p->dec_mft, MFT_MESSAGE_SET_D3D_MANAGER,
                               (ULONG_PTR)p->dxgi_mgr);
+
+  IMFAttributes *dec_attr = NULL;
+  if (SUCCEEDED(IMFTransform_GetAttributes(p->dec_mft, &dec_attr))) {
+    IMFAttributes_SetUINT32(dec_attr, &ZC_CODECAPI_AVLowLatencyMode, TRUE);
+    IMFAttributes_Release(dec_attr);
+  }
 
   ICodecAPI *codec = NULL;
   if (SUCCEEDED(IMFTransform_QueryInterface(p->dec_mft, &ZC_IID_ICodecAPI, (void **)&codec))) {
@@ -982,12 +1015,16 @@ int gpu_pipeline_create_ternary(gpu_pipeline_t **out_pipe, uint32_t width,
   p->width = width;
   p->height = height;
   p->fps = fps;
+  p->bitrate_bps = 50000000U;
   p->use_ternary = true;
   p->tern_threshold = threshold;
   p->tern_delta_min = delta_step;
   p->tern_delta_max = 32U;
   p->tern_gamma_q8 = gamma_q8;
   p->tern_neutral_y = neutral_y;
+  p->tern_rc_threshold = threshold;
+  p->tern_rc_intra_err_thr = 32U;
+  p->tern_rc_2x = false;
 
   gpu_pipeline_info_t info;
   memset(&info, 0, sizeof(info));
@@ -1004,10 +1041,14 @@ int gpu_pipeline_create_ternary(gpu_pipeline_t **out_pipe, uint32_t width,
     gpu_pipeline_destroy(p);
     return rc;
   }
-
-  if (out_info) *out_info = info;
   *out_pipe = p;
+  if (out_info) *out_info = info;
   return 0;
+}
+
+void gpu_pipeline_set_bitrate(gpu_pipeline_t *p, uint32_t bitrate_bps) {
+  if (!p) return;
+  p->bitrate_bps = bitrate_bps;
 }
 
 void gpu_pipeline_destroy(gpu_pipeline_t *p) {
@@ -1072,13 +1113,21 @@ void gpu_pipeline_destroy(gpu_pipeline_t *p) {
 }
 
 static int vp_blit_textures(gpu_pipeline_t *p, ID3D11Texture2D *src_tex,
-                            ID3D11Texture2D *dst_tex) {
+                            UINT src_slice, ID3D11Texture2D *dst_tex) {
+  static unsigned vp_err_count = 0;
   D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd = {0};
   ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+  ivd.Texture2D.ArraySlice = src_slice;
   ID3D11VideoProcessorInputView *iv = NULL;
   HRESULT hr = ID3D11VideoDevice_CreateVideoProcessorInputView(
       p->vdev, (ID3D11Resource *)src_tex, p->vp_enum, &ivd, &iv);
-  if (FAILED(hr)) return -1;
+  if (FAILED(hr)) {
+    if (vp_err_count++ < 10) {
+      gpu_log_err("[GPU][VP] CreateVideoProcessorInputView failed: hr=0x%08lx slice=%u\n",
+                  (unsigned long)hr, src_slice);
+    }
+    return -1;
+  }
 
   D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd = {0};
   ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
@@ -1086,14 +1135,26 @@ static int vp_blit_textures(gpu_pipeline_t *p, ID3D11Texture2D *src_tex,
   hr = ID3D11VideoDevice_CreateVideoProcessorOutputView(
       p->vdev, (ID3D11Resource *)dst_tex, p->vp_enum, &ovd, &ov);
   if (FAILED(hr)) {
+    if (vp_err_count++ < 10) {
+      gpu_log_err("[GPU][VP] CreateVideoProcessorOutputView failed: hr=0x%08lx\n",
+                  (unsigned long)hr);
+    }
     ID3D11VideoProcessorInputView_Release(iv);
     return -1;
   }
+
+  RECT r = {0, 0, (LONG)p->width, (LONG)p->height};
+  ID3D11VideoContext_VideoProcessorSetStreamSourceRect(p->vctx, p->vp, 0, TRUE, &r);
+  ID3D11VideoContext_VideoProcessorSetOutputTargetRect(p->vctx, p->vp, TRUE, &r);
 
   D3D11_VIDEO_PROCESSOR_STREAM stream = {0};
   stream.Enable = TRUE;
   stream.pInputSurface = iv;
   hr = ID3D11VideoContext_VideoProcessorBlt(p->vctx, p->vp, ov, 0, 1, &stream);
+  if (FAILED(hr) && vp_err_count++ < 10) {
+    gpu_log_err("[GPU][VP] VideoProcessorBlt failed: hr=0x%08lx slice=%u\n",
+                (unsigned long)hr, src_slice);
+  }
 
   ID3D11VideoProcessorOutputView_Release(ov);
   ID3D11VideoProcessorInputView_Release(iv);
@@ -1168,7 +1229,7 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
 
   if (!p->use_direct_nvenc && !p->use_ternary) {
     /* Zero-copy GPU BGRA -> NV12 conversion in VRAM (MFT fallback only) */
-    vp_blit_textures(p, src_bgra, p->enc_nv12_tex);
+    vp_blit_textures(p, src_bgra, 0U, p->enc_nv12_tex);
   }
 
   if (acquired_dupl) {
@@ -1186,11 +1247,41 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
     UINT zero4[4] = {0, 0, 0, 0};
     ID3D11DeviceContext_ClearUnorderedAccessViewUint(p->ctx, p->tern_out_counter_uav, zero4);
 
+    uint32_t fps = (p->fps > 0U) ? p->fps : 60U;
+    uint32_t target_bytes = (p->bitrate_bps > 0U) ? (p->bitrate_bps / (8U * fps)) : 52083U;
+    uint32_t num_tiles = p->tern_tiles_x * p->tern_tiles_y;
+    uint32_t mv_reserve = 8U + num_tiles * 2U;
+    uint32_t target_words = (target_bytes > mv_reserve + 4096U)
+                                ? ((target_bytes - mv_reserve) / 4U)
+                                : 1024U;
+    uint32_t hard_cap_words = (target_words + (target_words >> 2)) & ~1U;
+    if (hard_cap_words < 1024U) hard_cap_words = 1024U;
+    if (hard_cap_words > p->tern_max_record_words) hard_cap_words = p->tern_max_record_words & ~1U;
+
+    /* Scale rolling intra-refresh cycles so it uses ~25% of target_words */
+    uint32_t intra_budget = target_words / 4U;
+    uint32_t words_per_row = (p->width * 3U) / 5U;
+    uint32_t rows_per_frame = (words_per_row > 0U && intra_budget >= words_per_row)
+                                  ? (intra_budget / words_per_row)
+                                  : 1U;
+    uint32_t intra_cycles = (p->height + rows_per_frame - 1U) / rows_per_frame;
+    if (intra_cycles < 30U) intra_cycles = 30U;
+    if (intra_cycles > 480U) intra_cycles = 480U;
+
+    uint32_t mode_flags = (frame_idx < 16U) ? 1U : (p->tern_rc_2x ? 1U : 0U);
+    uint32_t eff_blocks = (mode_flags != 0U) ? ((p->tern_total_blocks + 1U) >> 1)
+                                             : p->tern_total_blocks;
+    uint32_t enc_cap_words = (frame_idx < 16U) ? 140000U : hard_cap_words;
+    if (enc_cap_words > (p->tern_max_record_words & ~1U)) {
+      enc_cap_words = p->tern_max_record_words & ~1U;
+    }
+    uint32_t enc_thr = (frame_idx < 16U) ? 8U : p->tern_rc_threshold;
+
     tern_enc_cb_t ecb = {
-        p->width, p->height, p->tern_threshold, p->tern_delta_min,
+        p->width, p->height, enc_thr, p->tern_delta_min,
         p->tern_delta_max, p->tern_gamma_q8, p->tern_neutral_y, p->tern_total_blocks,
-        frame_idx, 120U, (frame_idx == 0) ? 255U : 32U, p->tern_tiles_x, p->tern_tiles_y,
-        6U, 15000U, 0U
+        frame_idx, intra_cycles, (frame_idx < 16U) ? 255U : p->tern_rc_intra_err_thr,
+        p->tern_tiles_x, p->tern_tiles_y, 4U, enc_cap_words, mode_flags
     };
     ID3D11DeviceContext_UpdateSubresource(p->ctx, (ID3D11Resource *)p->tern_enc_cb,
                                           0, NULL, &ecb, 0, 0);
@@ -1210,7 +1301,7 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
 
     /* Pass 2: CSEncode (YCbCr + ADM + Rolling Intra-Refresh) */
     ID3D11DeviceContext_CSSetShader(p->ctx, p->tern_cs_encode, NULL, 0);
-    ID3D11DeviceContext_Dispatch(p->ctx, (p->tern_total_blocks + 63U) / 64U, 1, 1);
+    ID3D11DeviceContext_Dispatch(p->ctx, (eff_blocks + 63U) / 64U, 1, 1);
 
     ID3D11ShaderResourceView *null_srv[2] = {NULL, NULL};
     ID3D11UnorderedAccessView *null_uav[4] = {NULL, NULL, NULL, NULL};
@@ -1223,22 +1314,65 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
                                      (ID3D11Resource *)p->tern_enc_mvs_buf);
 
     D3D11_MAPPED_SUBRESOURCE mr = {0};
-    uint32_t record_words = 0;
+    uint32_t raw_words = 0;
     if (SUCCEEDED(ID3D11DeviceContext_Map(p->ctx, (ID3D11Resource *)p->tern_out_counter_stg,
                                           0, D3D11_MAP_READ, 0, &mr))) {
-      record_words = *(const uint32_t *)mr.pData;
+      raw_words = *(const uint32_t *)mr.pData;
       ID3D11DeviceContext_Unmap(p->ctx, (ID3D11Resource *)p->tern_out_counter_stg, 0);
     }
-    if (record_words > p->tern_max_record_words) record_words = p->tern_max_record_words;
+    uint32_t record_words = (raw_words > enc_cap_words) ? enc_cap_words : raw_words;
+    record_words &= ~1U;
 
-    uint32_t mv_bytes = p->tern_tiles_x * p->tern_tiles_y * 8U;
+    /* Compact MVs: 0 bytes if all (0,0), else 2 bytes/tile (int8 dx, int8 dy) */
+    uint32_t mv_bytes = 0U;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(p->ctx, (ID3D11Resource *)p->tern_enc_mvs_stg,
+                                          0, D3D11_MAP_READ, 0, &mr))) {
+      const int32_t *mvs = (const int32_t *)mr.pData;
+      bool any_nz = false;
+      for (uint32_t i = 0; i < num_tiles; ++i) {
+        if ((mvs[i * 2U] | mvs[i * 2U + 1U]) != 0) {
+          any_nz = true;
+          break;
+        }
+      }
+      if (any_nz) {
+        mv_bytes = num_tiles * 2U;
+        int8_t *dst_mv = (int8_t *)(p->enc_out_buf + 8U);
+        for (uint32_t i = 0; i < num_tiles; ++i) {
+          dst_mv[i * 2U + 0U] = (int8_t)mvs[i * 2U + 0U];
+          dst_mv[i * 2U + 1U] = (int8_t)mvs[i * 2U + 1U];
+        }
+      }
+      ID3D11DeviceContext_Unmap(p->ctx, (ID3D11Resource *)p->tern_enc_mvs_stg, 0);
+    }
     memcpy(p->enc_out_buf, &record_words, sizeof(uint32_t));
     memcpy(p->enc_out_buf + sizeof(uint32_t), &mv_bytes, sizeof(uint32_t));
 
-    if (SUCCEEDED(ID3D11DeviceContext_Map(p->ctx, (ID3D11Resource *)p->tern_enc_mvs_stg,
-                                          0, D3D11_MAP_READ, 0, &mr))) {
-      memcpy(p->enc_out_buf + 8U, mr.pData, mv_bytes);
-      ID3D11DeviceContext_Unmap(p->ctx, (ID3D11Resource *)p->tern_enc_mvs_stg, 0);
+    /* Closed-loop frame rate controller (skip initial 16-frame convergence burst) */
+    if (frame_idx >= 16U) {
+      if (raw_words > target_words + (target_words >> 3)) {
+        if (!p->tern_rc_2x && raw_words > target_words + (target_words >> 1)) {
+          p->tern_rc_2x = true;
+        }
+        if (p->tern_rc_threshold < 14U) {
+        uint32_t step = (raw_words > target_words * 2U) ? 2U : 1U;
+        p->tern_rc_threshold += step;
+        if (p->tern_rc_threshold > 14U) p->tern_rc_threshold = 14U;
+      }
+      if (p->tern_rc_intra_err_thr < 96U) {
+        p->tern_rc_intra_err_thr += 8U;
+      }
+    } else if (raw_words < (target_words * 3U) / 4U) {
+      if (p->tern_rc_threshold > p->tern_threshold) {
+        p->tern_rc_threshold--;
+      }
+      if (p->tern_rc_intra_err_thr > 32U) {
+        p->tern_rc_intra_err_thr -= 4U;
+      }
+      if (p->tern_rc_2x && raw_words < (target_words >> 1)) {
+        p->tern_rc_2x = false;
+      }
+    }
     }
 
     size_t out_bytes = 8U + mv_bytes;
@@ -1261,7 +1395,7 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
     if (out_enc_us) *out_enc_us = qpc_delta_us(t1, t2);
     if (out_bitstream) *out_bitstream = p->enc_out_buf;
     if (out_len) *out_len = out_bytes;
-    if (out_keyframe) *out_keyframe = (frame_idx == 0);
+    if (out_keyframe) *out_keyframe = (frame_idx == 0) || (fps > 0U && (frame_idx % fps) == 0U);
     return 0;
   }
 
@@ -1442,11 +1576,23 @@ int gpu_pipeline_decode_and_present(gpu_pipeline_t *p,
     if (record_words > p->tern_max_record_words) record_words = p->tern_max_record_words;
     if (len < 8U + (size_t)mv_bytes + (size_t)record_words * sizeof(uint32_t)) return -1;
 
+    uint32_t num_tiles = p->tern_tiles_x * p->tern_tiles_y;
     D3D11_MAPPED_SUBRESOURCE mw = {0};
-    if (mv_bytes > 0 &&
-        SUCCEEDED(ID3D11DeviceContext_Map(p->ctx, (ID3D11Resource *)p->tern_dec_mvs_buf,
+    if (SUCCEEDED(ID3D11DeviceContext_Map(p->ctx, (ID3D11Resource *)p->tern_dec_mvs_buf,
                                           0, D3D11_MAP_WRITE_DISCARD, 0, &mw))) {
-      memcpy(mw.pData, bitstream + 8U, mv_bytes);
+      if (mv_bytes == 0U) {
+        memset(mw.pData, 0, (size_t)num_tiles * 8U);
+      } else if (mv_bytes == num_tiles * 2U) {
+        const int8_t *src_mv = (const int8_t *)(bitstream + 8U);
+        int32_t *dst_mv = (int32_t *)mw.pData;
+        for (uint32_t i = 0; i < num_tiles; ++i) {
+          dst_mv[i * 2U + 0U] = (int32_t)src_mv[i * 2U + 0U];
+          dst_mv[i * 2U + 1U] = (int32_t)src_mv[i * 2U + 1U];
+        }
+      } else {
+        uint32_t copy_mv = (mv_bytes <= num_tiles * 8U) ? mv_bytes : (num_tiles * 8U);
+        memcpy(mw.pData, bitstream + 8U, copy_mv);
+      }
       ID3D11DeviceContext_Unmap(p->ctx, (ID3D11Resource *)p->tern_dec_mvs_buf, 0);
     }
     if (record_words > 0 &&
@@ -1508,7 +1654,7 @@ int gpu_pipeline_decode_and_present(gpu_pipeline_t *p,
         ID3D11DeviceContext_CopyResource(p->ctx, (ID3D11Resource *)backbuf,
                                          (ID3D11Resource *)p->tern_dec_tex);
       } else {
-        vp_blit_textures(p, p->tern_dec_tex, backbuf);
+        vp_blit_textures(p, p->tern_dec_tex, 0U, backbuf);
       }
       ID3D11Texture2D_Release(backbuf);
     }
@@ -1533,26 +1679,44 @@ int gpu_pipeline_decode_and_present(gpu_pipeline_t *p,
   MFCreateSample(&in_sample);
   IMFSample_AddBuffer(in_sample, in_buf);
   IMFMediaBuffer_Release(in_buf);
+  LONGLONG dur = 10000000LL / (LONGLONG)(p->fps ? p->fps : 60U);
+  IMFSample_SetSampleTime(in_sample, (LONGLONG)(p->dec_frame_idx++) * dur);
+  IMFSample_SetSampleDuration(in_sample, dur);
 
+  static unsigned dec_err_count = 0;
   HRESULT hr = IMFTransform_ProcessInput(p->dec_mft, 0, in_sample, 0);
   IMFSample_Release(in_sample);
-  if (FAILED(hr)) return -40;
+  if (FAILED(hr)) {
+    if (dec_err_count++ < 10) {
+      gpu_log_err("[GPU][DEC] ProcessInput failed: hr=0x%08lx len=%zu\n",
+                  (unsigned long)hr, len);
+    }
+    return -40;
+  }
 
   MFT_OUTPUT_DATA_BUFFER out_data = {0};
   DWORD status = 0;
   bool decoded = false;
   ID3D11Texture2D *dec_tex = NULL;
+  UINT dec_sub = 0;
 
   for (int tries = 0; tries < 8; ++tries) {
     hr = IMFTransform_ProcessOutput(p->dec_mft, 0, 1, &out_data, &status);
     if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+      if (dec_err_count < 5) {
+        gpu_log_err("[GPU][DEC] ProcessOutput STREAM_CHANGE (try=%d)\n", tries);
+      }
       for (DWORD idx = 0; ; ++idx) {
         IMFMediaType *mt_avail = NULL;
         if (FAILED(IMFTransform_GetOutputAvailableType(p->dec_mft, 0, idx, &mt_avail))) break;
         GUID sub = {0};
         IMFMediaType_GetGUID(mt_avail, &ZC_MF_MT_SUBTYPE, &sub);
         if (IsEqualGUID(&sub, &ZC_MFVideoFormat_NV12)) {
-          IMFTransform_SetOutputType(p->dec_mft, 0, mt_avail, 0);
+          HRESULT hr_set = IMFTransform_SetOutputType(p->dec_mft, 0, mt_avail, 0);
+          if (FAILED(hr_set) && dec_err_count++ < 10) {
+            gpu_log_err("[GPU][DEC] SetOutputType(NV12) failed: hr=0x%08lx\n",
+                        (unsigned long)hr_set);
+          }
           IMFMediaType_Release(mt_avail);
           break;
         }
@@ -1560,16 +1724,41 @@ int gpu_pipeline_decode_and_present(gpu_pipeline_t *p,
       }
       continue;
     }
-    if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) break;
+    if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+      if (dec_err_count < 3) {
+        gpu_log_err("[GPU][DEC] ProcessOutput NEED_MORE_INPUT (len=%zu)\n", len);
+      }
+      break;
+    }
+    if (FAILED(hr)) {
+      if (dec_err_count++ < 10) {
+        gpu_log_err("[GPU][DEC] ProcessOutput failed: hr=0x%08lx status=0x%lx\n",
+                    (unsigned long)hr, (unsigned long)status);
+      }
+      break;
+    }
     if (SUCCEEDED(hr) && out_data.pSample) {
       IMFMediaBuffer *ob = NULL;
-      if (SUCCEEDED(IMFSample_GetBufferByIndex(out_data.pSample, 0, &ob))) {
+      HRESULT hr_buf = IMFSample_GetBufferByIndex(out_data.pSample, 0, &ob);
+      if (SUCCEEDED(hr_buf)) {
         IMFDXGIBuffer *dxgi_buf = NULL;
-        if (SUCCEEDED(IMFMediaBuffer_QueryInterface(ob, &IID_IMFDXGIBuffer, (void **)&dxgi_buf))) {
-          IMFDXGIBuffer_GetResource(dxgi_buf, &IID_ID3D11Texture2D, (void **)&dec_tex);
+        HRESULT hr_qi = IMFMediaBuffer_QueryInterface(ob, &IID_IMFDXGIBuffer, (void **)&dxgi_buf);
+        if (SUCCEEDED(hr_qi)) {
+          HRESULT hr_res = IMFDXGIBuffer_GetResource(dxgi_buf, &IID_ID3D11Texture2D, (void **)&dec_tex);
+          (void)IMFDXGIBuffer_GetSubresourceIndex(dxgi_buf, &dec_sub);
+          if (FAILED(hr_res) && dec_err_count++ < 10) {
+            gpu_log_err("[GPU][DEC] IMFDXGIBuffer_GetResource failed: hr=0x%08lx\n",
+                        (unsigned long)hr_res);
+          }
           IMFDXGIBuffer_Release(dxgi_buf);
+        } else if (dec_err_count++ < 10) {
+          gpu_log_err("[GPU][DEC] QueryInterface(IMFDXGIBuffer) failed: hr=0x%08lx\n",
+                      (unsigned long)hr_qi);
         }
         IMFMediaBuffer_Release(ob);
+      } else if (dec_err_count++ < 10) {
+        gpu_log_err("[GPU][DEC] GetBufferByIndex failed: hr=0x%08lx\n",
+                    (unsigned long)hr_buf);
       }
       IMFSample_Release(out_data.pSample);
       decoded = (dec_tex != NULL);
@@ -1581,15 +1770,23 @@ int gpu_pipeline_decode_and_present(gpu_pipeline_t *p,
 
   if (decoded && dec_tex) {
     ID3D11Texture2D *backbuf = NULL;
-    if (SUCCEEDED(IDXGISwapChain1_GetBuffer(p->swapchain, 0, &IID_ID3D11Texture2D,
-                                            (void **)&backbuf))) {
-      vp_blit_textures(p, dec_tex, backbuf);
+    HRESULT hr_bb = IDXGISwapChain1_GetBuffer(p->swapchain, 0, &IID_ID3D11Texture2D,
+                                              (void **)&backbuf);
+    if (SUCCEEDED(hr_bb)) {
+      vp_blit_textures(p, dec_tex, dec_sub, backbuf);
       ID3D11Texture2D_Release(backbuf);
+    } else if (dec_err_count++ < 10) {
+      gpu_log_err("[GPU][DEC] SwapChain GetBuffer failed: hr=0x%08lx\n",
+                  (unsigned long)hr_bb);
     }
     ID3D11Texture2D_Release(dec_tex);
 
     UINT present_flags = p->tearing_supported ? DXGI_PRESENT_ALLOW_TEARING : 0;
-    IDXGISwapChain1_Present(p->swapchain, 0, present_flags);
+    HRESULT hr_prs = IDXGISwapChain1_Present(p->swapchain, 0, present_flags);
+    if (FAILED(hr_prs) && dec_err_count++ < 10) {
+      gpu_log_err("[GPU][DEC] SwapChain Present failed: hr=0x%08lx\n",
+                  (unsigned long)hr_prs);
+    }
   }
 
   QueryPerformanceCounter(&t2);

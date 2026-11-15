@@ -58,6 +58,8 @@ int gpu_pipeline_ternary_compute_psnr(gpu_pipeline_t *pipe, double *out_psnr_db)
  */
 int gpu_pipeline_ternary_ref_mismatch(gpu_pipeline_t *pipe, uint64_t *out_mismatch_px);
 
+void gpu_pipeline_set_bitrate(gpu_pipeline_t *pipe, uint32_t bitrate_bps);
+
 void gpu_pipeline_destroy(gpu_pipeline_t *pipe);
 
 /** Captures (or GPU-renders) one frame in VRAM and encodes it to H.264. */
@@ -74,6 +76,9 @@ int gpu_pipeline_decode_and_present(gpu_pipeline_t *pipe,
 
 /** Pumps Win32 window messages; returns false if user closed the window. */
 bool gpu_pipeline_pump_events(gpu_pipeline_t *pipe);
+
+/** Optional FILE* for mirroring GPU pipeline error logs to a log file. */
+void gpu_pipeline_set_log_file(void *stdio_file);
 
 uint64_t qpc_now_us(void);
 

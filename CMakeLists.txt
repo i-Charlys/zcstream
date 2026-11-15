@@ -155,3 +155,41 @@ if(MSVC)
 else()
   target_compile_options(zcrudp_ternary_bench PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter -mavx2)
 endif()
+
+# Live 2-PC / Continuous Screen Streaming (Sender / Receiver)
+add_executable(zcrudp_stream
+  src/stream_live.c
+  src/gpu_pipeline_win32.c
+  src/zcrudp_video_bridge.c
+)
+
+target_include_directories(zcrudp_stream PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
+  "${TERN_VID_DIR}/include"
+)
+
+target_compile_definitions(zcrudp_stream PRIVATE
+  TERN_VID_SHADERS_DIR="${TERN_VID_DIR}/shaders"
+)
+
+target_link_libraries(zcrudp_stream PRIVATE
+  zcrudp_lib
+  d3d11
+  dxgi
+  dxguid
+  d3dcompiler
+  mfplat
+  mfuuid
+  mfreadwrite
+  ws2_32
+  winmm
+  ole32
+  user32
+  gdi32
+)
+
+if(MSVC)
+  target_compile_options(zcrudp_stream PRIVATE /O2 /W3)
+else()
+  target_compile_options(zcrudp_stream PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter -mavx2)
+endif()
