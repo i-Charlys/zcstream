@@ -1,0 +1,372 @@
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <mmsystem.h>
+
+#include "context.hpp"
+#include "device.hpp"
+#include "pyrowave_decoder.hpp"
+#include "pyrowave_encoder.hpp"
+#include "zcrudp_video_bridge.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+using namespace Granite;
+using namespace Vulkan;
+
+static LARGE_INTEGER g_qpc_freq;
+
+static uint64_t qpc_now_us(void) {
+  if (g_qpc_freq.QuadPart == 0) {
+    QueryPerformanceFrequency(&g_qpc_freq);
+  }
+  LARGE_INTEGER now;
+  QueryPerformanceCounter(&now);
+  return (uint64_t)((now.QuadPart * 1000000LL) / g_qpc_freq.QuadPart);
+}
+
+static double qpc_delta_us(LARGE_INTEGER t0, LARGE_INTEGER t1) {
+  return ((double)(t1.QuadPart - t0.QuadPart) * 1000000.0) /
+         (double)g_qpc_freq.QuadPart;
+}
+
+static void print_stat_row(const char *label, std::vector<double> &vals) {
+  if (vals.empty()) return;
+  std::sort(vals.begin(), vals.end());
+  double sum = 0.0;
+  for (double v : vals) sum += v;
+  size_t n = vals.size();
+  printf("  %-20s | min: %7.1f us | p50: %7.1f us | p95: %7.1f us | p99: %7.1f us | avg: %7.1f us\n",
+         label, vals[0], vals[(n * 50) / 100], vals[(n * 95) / 100],
+         vals[(n * 99) / 100], sum / (double)n);
+}
+
+struct YCbCrImages {
+  ImageHandle images[3];
+  PyroWave::ViewBuffers views;
+};
+
+static YCbCrImages create_ycbcr_images(Device &device, int width, int height,
+                                       VkFormat fmt, PyroWave::ChromaSubsampling chroma) {
+  YCbCrImages out;
+  auto info = ImageCreateInfo::immutable_2d_image(width, height, fmt);
+  info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+               VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+  out.images[0] = device.create_image(info);
+  if (chroma == PyroWave::ChromaSubsampling::Chroma420) {
+    info.width >>= 1;
+    info.height >>= 1;
+  }
+  out.images[1] = device.create_image(info);
+  out.images[2] = device.create_image(info);
+
+  for (int i = 0; i < 3; ++i) {
+    out.views.planes[i] = &out.images[i]->get_view();
+  }
+  return out;
+}
+
+int main(int argc, char **argv) {
+  int width = 1920;
+  int height = 1080;
+  uint32_t target_frame_bytes = 125000; /* ~120 Mbps @ 120fps */
+  size_t num_frames = 200;
+  uint8_t fec_shards = 0;
+  zc_net_impair_t impair = {};
+
+  for (int i = 1; i < argc; ++i) {
+    if (strcmp(argv[i], "--fec") == 0 && i + 1 < argc) fec_shards = (uint8_t)atoi(argv[++i]);
+    else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) num_frames = (size_t)atoi(argv[++i]);
+    else if (strcmp(argv[i], "--target-bytes") == 0 && i + 1 < argc) target_frame_bytes = (uint32_t)atoi(argv[++i]);
+    else if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) width = atoi(argv[++i]);
+    else if (strcmp(argv[i], "--height") == 0 && i + 1 < argc) height = atoi(argv[++i]);
+    else if (strcmp(argv[i], "--nasty") == 0) {
+      impair.loss_pct = 5;
+      impair.burst_prob_pct = 8;
+      impair.burst_len = 3;
+      impair.reorder_pct = 15;
+      impair.dup_pct = 5;
+      impair.base_owd_us = 2000;
+      impair.jitter_us = 3000;
+    }
+  }
+
+  QueryPerformanceFrequency(&g_qpc_freq);
+  timeBeginPeriod(1);
+
+  WSADATA wsa;
+  if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+    fprintf(stderr, "WSAStartup failed\n");
+    return 1;
+  }
+
+  SOCKET rx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  SOCKET tx_sock = WSASocketA(AF_INET, SOCK_DGRAM, IPPROTO_UDP, nullptr, 0,
+                              WSA_FLAG_REGISTERED_IO);
+  if (tx_sock == INVALID_SOCKET) {
+    tx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  }
+  int rcvbuf = 4 * 1024 * 1024;
+  setsockopt(rx_sock, SOL_SOCKET, SO_RCVBUF, (const char *)&rcvbuf, sizeof(rcvbuf));
+  setsockopt(tx_sock, SOL_SOCKET, SO_SNDBUF, (const char *)&rcvbuf, sizeof(rcvbuf));
+
+  struct sockaddr_in bind_addr = {};
+  bind_addr.sin_family = AF_INET;
+  bind_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bind_addr.sin_port = 0;
+  if (bind(rx_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) != 0) {
+    fprintf(stderr, "bind failed\n");
+    return 1;
+  }
+  int addr_len = sizeof(bind_addr);
+  getsockname(rx_sock, (struct sockaddr *)&bind_addr, &addr_len);
+  connect(tx_sock, (struct sockaddr *)&bind_addr, addr_len);
+  u_long nonblock = 1;
+  ioctlsocket(rx_sock, FIONBIO, &nonblock);
+
+  if (!Context::init_loader(nullptr)) {
+    fprintf(stderr, "Vulkan loader init failed\n");
+    return 1;
+  }
+  Context ctx;
+  if (!ctx.init_instance_and_device(nullptr, 0, nullptr, 0,
+                                    CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT)) {
+    fprintf(stderr, "Vulkan context init failed\n");
+    return 1;
+  }
+  Device device;
+  device.set_context(ctx);
+
+  const auto &props = device.get_gpu_properties();
+  auto chroma = PyroWave::ChromaSubsampling::Chroma420;
+  auto enc_inputs = create_ycbcr_images(device, width, height, VK_FORMAT_R8_UNORM, chroma);
+  auto dec_outputs = create_ycbcr_images(device, width, height, VK_FORMAT_R8_UNORM, chroma);
+
+  /* Populate input planes in VRAM with a clean gradient pattern */
+  {
+    auto cmd = device.request_command_buffer();
+    for (int i = 0; i < 3; ++i) {
+      cmd->image_barrier(*enc_inputs.images[i], VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, 0,
+                         VK_PIPELINE_STAGE_2_COPY_BIT,
+                         VK_ACCESS_2_TRANSFER_WRITE_BIT);
+      uint8_t *ptr = static_cast<uint8_t *>(cmd->update_image(*enc_inputs.images[i]));
+      uint32_t pw = enc_inputs.images[i]->get_width();
+      uint32_t ph = enc_inputs.images[i]->get_height();
+      for (uint32_t y = 0; y < ph; ++y) {
+        memset(ptr + (size_t)y * pw, (uint8_t)((y + i * 64) & 0xFF), pw);
+      }
+      cmd->image_barrier(*enc_inputs.images[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_COPY_BIT,
+                         VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    }
+    device.submit(cmd);
+    device.wait_idle();
+  }
+
+  PyroWave::Encoder enc;
+  PyroWave::Decoder dec;
+  if (!enc.init(&device, width, height, chroma)) {
+    fprintf(stderr, "PyroWave::Encoder init failed\n");
+    return 1;
+  }
+  bool frag_dec = PyroWave::Decoder::device_prefers_fragment_path(device);
+  if (!dec.init(&device, width, height, chroma, frag_dec)) {
+    fprintf(stderr, "PyroWave::Decoder init failed\n");
+    return 1;
+  }
+
+  BufferCreateInfo bi = {};
+  bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  bi.size = enc.get_meta_required_size();
+  bi.domain = BufferDomain::Device;
+  auto meta_dev = device.create_buffer(bi);
+  bi.domain = BufferDomain::CachedHost;
+  auto meta_host = device.create_buffer(bi);
+
+  bi.size = target_frame_bytes + 2 * enc.get_meta_required_size();
+  bi.domain = BufferDomain::Device;
+  auto bs_dev = device.create_buffer(bi);
+  bi.domain = BufferDomain::CachedHost;
+  auto bs_host = device.create_buffer(bi);
+
+  PyroWave::Encoder::BitstreamBuffers bs_bufs = {};
+  bs_bufs.meta.buffer = meta_dev.get();
+  bs_bufs.meta.size = meta_dev->get_create_info().size;
+  bs_bufs.bitstream.buffer = bs_dev.get();
+  bs_bufs.bitstream.size = bs_dev->get_create_info().size;
+  bs_bufs.target_size = target_frame_bytes;
+
+  zc_video_tx_t *tx = (zc_video_tx_t *)calloc(1, sizeof(*tx));
+  zc_video_rx_t *rx = (zc_video_rx_t *)calloc(1, sizeof(*rx));
+  uint32_t bps_est = target_frame_bytes * 8U * 120U;
+  if (!tx || !rx ||
+      zc_video_tx_init(tx, RUDP_PAGE_POOL_PAGES, bps_est, bps_est / 4U,
+                       bps_est * 2U, fec_shards, &impair, qpc_now_us()) != 0 ||
+      zc_video_rx_init(rx, 2 * 1024 * 1024) != 0) {
+    fprintf(stderr, "zcrudp bridge init failed\n");
+    return 1;
+  }
+  if (fec_shards == 0 && zc_video_tx_enable_rio(tx, (uintptr_t)tx_sock) == 0) {
+    printf("Winsock RIO   : ENABLED (Registered I/O batch submit)\n");
+  }
+
+  printf("=== Pyrowave (Vulkan Wavelet GPU) + zcrudp::nextgen ===\n");
+  printf("GPU Adapter   : %s (Vulkan)\n", props.deviceName);
+  printf("Codec         : Pyrowave Wavelet (%s decode) | %dx%d Chroma420\n",
+         frag_dec ? "Fragment" : "Compute", width, height);
+  printf("Target Frame  : %u bytes (~%u Mbps @ 120fps) | Cauchy FEC=%u shards\n\n",
+         target_frame_bytes, (target_frame_bytes * 8U * 120U) / 1000000U, fec_shards);
+
+  std::vector<uint8_t> pkt_buf(target_frame_bytes + 65536);
+  std::vector<double> enc_arr, ntx_arr, nrx_arr, dec_arr, tot_arr;
+  size_t total_payload_bytes = 0;
+  uint8_t rx_pkt[2048];
+  const uint32_t warmup = 30;
+  bool has_impair = (impair.loss_pct > 0 || impair.burst_prob_pct > 0 ||
+                     impair.reorder_pct > 0 || impair.dup_pct > 0 ||
+                     impair.base_owd_us > 0 || impair.jitter_us > 0);
+  bool has_delay = (impair.base_owd_us > 0 || impair.jitter_us > 0 || impair.reorder_pct > 0);
+  Fence fence;
+
+  for (uint32_t f = 0; f < (uint32_t)(num_frames + warmup); ++f) {
+    LARGE_INTEGER t0, t1, t2, t3, t4;
+    QueryPerformanceCounter(&t0);
+
+    /* 1. Pyrowave GPU Wavelet Encode + Readback */
+    {
+      auto cmd = device.request_command_buffer(CommandBuffer::Type::AsyncCompute);
+      enc.encode(*cmd, enc_inputs.views, bs_bufs);
+      cmd->barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                   VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+      cmd->copy_buffer(*bs_host, *bs_dev);
+      cmd->copy_buffer(*meta_host, *meta_dev);
+      cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                   VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                   VK_ACCESS_HOST_READ_BIT);
+      fence.reset();
+      device.submit(cmd, &fence);
+      fence->wait();
+    }
+
+    PyroWave::Encoder::Packet packet = {};
+    enc.packetize(&packet, target_frame_bytes, pkt_buf.data(), pkt_buf.size(),
+                  device.map_host_buffer(*meta_host, MEMORY_ACCESS_READ_BIT),
+                  device.map_host_buffer(*bs_host, MEMORY_ACCESS_READ_BIT));
+
+    QueryPerformanceCounter(&t1);
+
+    /* 2. zcrudp TX (PagePool + Scatter-Gather WSASendTo + FEC) */
+    uint64_t now_us = qpc_now_us();
+    zc_video_tx_send_frame(tx, (uintptr_t)tx_sock, &bind_addr, addr_len,
+                           f, pkt_buf.data() + packet.offset, packet.size,
+                           true, now_us, (f >= warmup) && has_impair);
+
+    QueryPerformanceCounter(&t2);
+
+    /* 3. zcrudp RX + Push into Pyrowave Decoder */
+    bool got_frame = false;
+    size_t rx_len = 0;
+    uint32_t rx_fid = 0;
+    bool rx_kf = false, rx_fec = false;
+    uint64_t t_rx_start = qpc_now_us();
+    uint64_t wait_limit = has_delay ? (uint64_t)(impair.base_owd_us + impair.jitter_us + 8500U) : 500U;
+
+    while ((qpc_now_us() - t_rx_start) <= wait_limit) {
+      if (has_delay) {
+        zc_video_tx_flush_net(tx, (uintptr_t)tx_sock, &bind_addr, addr_len, qpc_now_us());
+      }
+      int rlen = recvfrom(rx_sock, (char *)rx_pkt, sizeof(rx_pkt), 0, nullptr, nullptr);
+      if (rlen > 0) {
+        if (zc_video_rx_feed(rx, rx_pkt, (size_t)rlen, &rx_len, &rx_fid,
+                             &rx_kf, &rx_fec) == 1) {
+          got_frame = true;
+          break;
+        }
+      } else if (!has_delay) {
+        break;
+      }
+    }
+
+    bool ready = false;
+    if (got_frame) {
+      dec.clear();
+      dec.push_packet(rx->frame_buf, rx_len);
+      ready = dec.decode_is_ready(false);
+    }
+
+    QueryPerformanceCounter(&t3);
+
+    /* 4. Pyrowave GPU Wavelet Decode */
+    if (ready) {
+      auto cmd = device.request_command_buffer();
+      cmd->begin_barrier_batch();
+      for (auto &plane : dec_outputs.views.planes) {
+        cmd->image_barrier(plane->get_image(), VK_IMAGE_LAYOUT_UNDEFINED,
+                           VK_IMAGE_LAYOUT_GENERAL,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+      }
+      cmd->end_barrier_batch();
+      dec.decode(*cmd, dec_outputs.views);
+      fence.reset();
+      device.submit(cmd, &fence);
+      fence->wait();
+    }
+
+    QueryPerformanceCounter(&t4);
+    device.next_frame_context();
+
+    if (f >= warmup && ready) {
+      double e_us = qpc_delta_us(t0, t1);
+      double tx_us = qpc_delta_us(t1, t2);
+      double rx_us = qpc_delta_us(t2, t3);
+      double d_us = qpc_delta_us(t3, t4);
+      enc_arr.push_back(e_us);
+      ntx_arr.push_back(tx_us);
+      nrx_arr.push_back(rx_us);
+      dec_arr.push_back(d_us);
+      tot_arr.push_back(e_us + tx_us + rx_us + d_us);
+      total_payload_bytes += packet.size;
+    }
+  }
+
+  printf("Measured Frames: %zu / %zu | Avg Wavelet Frame: %.1f KB\n",
+         tot_arr.size(), num_frames,
+         tot_arr.empty() ? 0.0 : ((double)total_payload_bytes / (double)tot_arr.size() / 1024.0));
+  printf("Network TX/RX  : %llu pkts sent | %llu completed | %llu FEC-recovered\n\n",
+         (unsigned long long)tx->packets_sent,
+         (unsigned long long)rx->frames_completed,
+         (unsigned long long)rx->frames_fec_recovered);
+
+  printf("--- Pyrowave + zcrudp Pipeline Latency Breakdown (microseconds) ---\n");
+  print_stat_row("1. Pyrowave Encode", enc_arr);
+  print_stat_row("2. zcrudp TX", ntx_arr);
+  print_stat_row("3. zcrudp RX", nrx_arr);
+  print_stat_row("4. Pyrowave Decode", dec_arr);
+  printf("  ----------------------------------------------------------------------------------------\n");
+  print_stat_row("TOTAL GLASS-GLASS", tot_arr);
+
+  device.wait_idle();
+  zc_video_rx_destroy(rx);
+  zc_video_tx_destroy(tx);
+  free(rx);
+  free(tx);
+  closesocket(rx_sock);
+  closesocket(tx_sock);
+  WSACleanup();
+  timeEndPeriod(1);
+  return 0;
+}
