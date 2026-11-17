@@ -3207,6 +3207,16 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
                                      (ID3D11Resource *)p->tern_out_counter_buf);
     ID3D11DeviceContext_CopyResource(p->ctx, (ID3D11Resource *)p->tern_enc_mvs_stg[stg_idx],
                                      (ID3D11Resource *)p->tern_enc_mvs_buf[mv_cur]);
+    /* The records go back in the same round trip, up to this frame's cap:
+     * waiting for the count first and then for the records cost a second
+     * GPU synchronisation (0.35 to 0.5 ms). Copying words past the count is
+     * a few tens of microseconds of PCIe traffic. */
+    if (enc_cap_words > 0U) {
+      D3D11_BOX box = {0, 0, 0, enc_cap_words * (UINT)sizeof(uint32_t), 1, 1};
+      ID3D11DeviceContext_CopySubresourceRegion(
+          p->ctx, (ID3D11Resource *)p->tern_out_records_stg[stg_idx], 0, 0, 0, 0,
+          (ID3D11Resource *)p->tern_out_records_buf, 0, &box);
+    }
     ID3D11DeviceContext_End(p->ctx, (ID3D11Asynchronous *)p->tern_readback_query[stg_idx]);
     wait_query_event(p->ctx, p->tern_readback_query[stg_idx]);
 
@@ -3220,15 +3230,6 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
     record_words &= ~1U;
     p->tern_last_raw_words = record_words;
 
-    /* Kick off records DMA copy before CPU MV packing so GPU copy overlaps with CPU work */
-    if (record_words > 0) {
-      D3D11_BOX box = {0, 0, 0, record_words * (UINT)sizeof(uint32_t), 1, 1};
-      ID3D11DeviceContext_CopySubresourceRegion(
-          p->ctx, (ID3D11Resource *)p->tern_out_records_stg[stg_idx], 0, 0, 0, 0,
-          (ID3D11Resource *)p->tern_out_records_buf, 0, &box);
-      ID3D11DeviceContext_End(p->ctx, (ID3D11Asynchronous *)p->tern_readback_query[stg_idx]);
-      ID3D11DeviceContext_Flush(p->ctx);
-    }
 
     /* Compact MVs: 0 bytes if all (0,0), else 2 bytes/tile (int8 dx, int8 dy) */
     uint32_t mv_bytes = 0U;
@@ -3322,7 +3323,6 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
 
     size_t out_bytes = 8U + mv_bytes;
     if (record_words > 0) {
-      wait_query_event(p->ctx, p->tern_readback_query[stg_idx]);
       if (SUCCEEDED(map_read_nonblocking(p->ctx, (ID3D11Resource *)p->tern_out_records_stg[stg_idx], &mr))) {
         size_t rec_bytes = (size_t)record_words * sizeof(uint32_t);
         size_t packed = 0;
