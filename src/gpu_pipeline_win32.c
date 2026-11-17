@@ -126,6 +126,14 @@ static HRESULT map_read_nonblocking(ID3D11DeviceContext *ctx, ID3D11Resource *re
 #define TERN_RC_NO_2X 0
 #endif
 
+/* Frames in a row under half the budget before the 2x deltas are dropped.
+ * Leaving 2x after one cheap frame made the controller flip every frame on
+ * still content (a 2x frame is cheap, the 1x frame after it pays for all the
+ * detail 2x left), and where it settled depended on GPU scheduling. */
+#ifndef TERN_RC_2X_CALM
+#define TERN_RC_2X_CALM 8U
+#endif
+
 /* Transform intra qp = TERN_TQ_QP_BASE + 2 * threshold (clamped 12..51 in the shader). */
 #ifndef TERN_TQ_QP_BASE
 #define TERN_TQ_QP_BASE 16U
@@ -271,6 +279,7 @@ struct gpu_pipeline_s {
   uint8_t *tern_ec_scratch;     /* chunk streams before they are laid end to end */
   size_t tern_ec_scratch_cap;
   bool tern_rc_2x;
+  uint32_t tern_rc_2x_calm;     /* consecutive frames under half the budget in 2x */
   bool tern_intra8;             /* rolling refresh in 8-bit 2-px intra (budget to spare) */
   bool tern_tq;                 /* transform intra on 4x4 blocks (CSIntraT / CSITrans) */
   bool tern_tq_inter;           /* ... and transform-coded motion residual */
@@ -282,6 +291,15 @@ struct gpu_pipeline_s {
   uint32_t tern_last_raw_words; /* record words read back for the last frame, before packing */
   uint32_t tern_tq_blocks;      /* 4x4 blocks in a frame */
   ID3D11ComputeShader *tern_cs_intra_t;
+  ID3D11ComputeShader *tern_cs_intra_t_count; /* what each 4x4 block wants */
+  ID3D11ComputeShader *tern_cs_tq_scan_a;     /* budget: group bases of the demand */
+  ID3D11ComputeShader *tern_cs_tq_mid;        /* budget: first rule, accepted words */
+  ID3D11ComputeShader *tern_cs_tq_scan_v;     /* budget: group bases of the offsets */
+  ID3D11ComputeShader *tern_cs_tq_final;      /* budget: starts the record counter */
+  ID3D11Buffer *tern_tq_scratch_buf;          /* see g_tq_scratch */
+  ID3D11UnorderedAccessView *tern_tq_scratch_uav;
+  ID3D11Buffer *tern_tq_stage_buf;            /* transform records before the budget */
+  ID3D11UnorderedAccessView *tern_tq_stage_uav;
   ID3D11ComputeShader *tern_cs_itrans;
   ID3D11Buffer *tern_enc_tflag_buf;
   ID3D11UnorderedAccessView *tern_enc_tflag_uav;
@@ -2181,6 +2199,13 @@ static int setup_ternary_hlsl(gpu_pipeline_t *p, gpu_pipeline_info_t *info) {
     return -22;
   if (compile_hlsl_cs(p->dev, "ternary_encode.hlsl", "CSIntraT", &p->tern_cs_intra_t) != 0)
     return -20;
+  if (compile_hlsl_cs(p->dev, "ternary_encode.hlsl", "CSIntraTCount", &p->tern_cs_intra_t_count) != 0)
+    return -20;
+  if (compile_hlsl_cs(p->dev, "ternary_encode.hlsl", "CSTqScanA", &p->tern_cs_tq_scan_a) != 0 ||
+      compile_hlsl_cs(p->dev, "ternary_encode.hlsl", "CSTqMid", &p->tern_cs_tq_mid) != 0 ||
+      compile_hlsl_cs(p->dev, "ternary_encode.hlsl", "CSTqScanV", &p->tern_cs_tq_scan_v) != 0 ||
+      compile_hlsl_cs(p->dev, "ternary_encode.hlsl", "CSTqFinal", &p->tern_cs_tq_final) != 0)
+    return -20;
   if (compile_hlsl_cs(p->dev, "ternary_decode.hlsl", "CSITrans", &p->tern_cs_itrans) != 0)
     return -22;
 
@@ -2284,6 +2309,13 @@ static int setup_ternary_hlsl(gpu_pipeline_t *p, gpu_pipeline_info_t *info) {
   p->tern_tq_blocks = ((p->width + 3U) / 4U) * ((p->height + 3U) / 4U);
   if (tern_create_uint_buffer(p->dev, p->tern_tq_blocks, &p->tern_enc_tflag_buf,
                               &p->tern_enc_tflag_uav, &p->tern_enc_tflag_srv) != 0 ||
+      /* 2 words per position (blocks rounded up to 64), 2 per group of 64, 4 more */
+      tern_create_uint_buffer(p->dev, ((p->tern_tq_blocks + 63U) & ~63U) * 2U +
+                                          ((p->tern_tq_blocks + 63U) / 64U) * 2U + 4U,
+                              &p->tern_tq_scratch_buf,
+                              &p->tern_tq_scratch_uav, NULL) != 0 ||
+      tern_create_uint_buffer(p->dev, p->tern_max_record_words, &p->tern_tq_stage_buf,
+                              &p->tern_tq_stage_uav, NULL) != 0 ||
       tern_create_uint_buffer(p->dev, p->tern_tq_blocks * 48U, &p->tern_dec_coef_buf,
                               &p->tern_dec_coef_uav, NULL) != 0 ||
       tern_create_uint_buffer(p->dev, p->tern_tq_blocks, &p->tern_dec_tflag_buf,
@@ -2377,9 +2409,11 @@ static int setup_ternary_hlsl(gpu_pipeline_t *p, gpu_pipeline_info_t *info) {
     if (FAILED(hr)) return -25;
   }
 
-  /* Atomic counter buffer (4 bytes) + triple-buffered staging + event queries */
+  /* Record counter: [0] words written (the slot allocator), [1] transform
+   * words the budget refused (only the rate control reads it), plus
+   * triple-buffered staging + event queries */
   memset(&bd, 0, sizeof(bd));
-  bd.ByteWidth = 4U;
+  bd.ByteWidth = 8U;
   bd.Usage = D3D11_USAGE_DEFAULT;
   bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
   bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
@@ -2389,14 +2423,14 @@ static int setup_ternary_hlsl(gpu_pipeline_t *p, gpu_pipeline_info_t *info) {
   memset(&uavd, 0, sizeof(uavd));
   uavd.Format = DXGI_FORMAT_R32_TYPELESS;
   uavd.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-  uavd.Buffer.NumElements = 1U;
+  uavd.Buffer.NumElements = 2U;
   uavd.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
   hr = ID3D11Device_CreateUnorderedAccessView(
       p->dev, (ID3D11Resource *)p->tern_out_counter_buf, &uavd, &p->tern_out_counter_uav);
   if (FAILED(hr)) return -26;
 
   memset(&bd, 0, sizeof(bd));
-  bd.ByteWidth = 4U;
+  bd.ByteWidth = 8U;
   bd.Usage = D3D11_USAGE_STAGING;
   bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
   D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
@@ -2652,6 +2686,15 @@ void gpu_pipeline_destroy(gpu_pipeline_t *p) {
   if (p->tern_cs_motion_decay) ID3D11ComputeShader_Release(p->tern_cs_motion_decay);
   if (p->tern_cs_encode) ID3D11ComputeShader_Release(p->tern_cs_encode);
   if (p->tern_cs_intra_t) ID3D11ComputeShader_Release(p->tern_cs_intra_t);
+  if (p->tern_cs_intra_t_count) ID3D11ComputeShader_Release(p->tern_cs_intra_t_count);
+  if (p->tern_cs_tq_scan_a) ID3D11ComputeShader_Release(p->tern_cs_tq_scan_a);
+  if (p->tern_cs_tq_mid) ID3D11ComputeShader_Release(p->tern_cs_tq_mid);
+  if (p->tern_cs_tq_scan_v) ID3D11ComputeShader_Release(p->tern_cs_tq_scan_v);
+  if (p->tern_cs_tq_final) ID3D11ComputeShader_Release(p->tern_cs_tq_final);
+  if (p->tern_tq_scratch_uav) ID3D11UnorderedAccessView_Release(p->tern_tq_scratch_uav);
+  if (p->tern_tq_scratch_buf) ID3D11Buffer_Release(p->tern_tq_scratch_buf);
+  if (p->tern_tq_stage_uav) ID3D11UnorderedAccessView_Release(p->tern_tq_stage_uav);
+  if (p->tern_tq_stage_buf) ID3D11Buffer_Release(p->tern_tq_stage_buf);
   if (p->tern_hint_srv) ID3D11ShaderResourceView_Release(p->tern_hint_srv);
   if (p->tern_hint_buf) ID3D11Buffer_Release(p->tern_hint_buf);
   free(p->tern_hint_cpu);
@@ -3075,7 +3118,11 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
       intra_cycles = 16U;
     } else if (p->tern_static_scene) {
       uint32_t resync_mod = (fps > 0U) ? (fps * 3U) : 360U;
-      if ((frame_idx % resync_mod) < 30U) {
+      /* Counted from the end of the start burst: its 6-bit refresh leaves
+       * errors inside the deadzone that only a full-precision pass removes,
+       * and waiting 3 s for the first one left still content up to 3 dB off
+       * (how much depended on which records won the burst's cap). */
+      if (((frame_idx - 16U) % resync_mod) < 30U) {
         intra_cycles = 30U;
       } else {
         intra_cycles = (p->height > 720U) ? p->height : 720U;
@@ -3087,7 +3134,7 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
      * size so that it is the same for every block of this one. */
     if (!kf_burst && p->tern_intra8) mode_flags |= 2U;
     if (p->tern_tq) mode_flags |= 4U;
-    if (p->tern_tq && p->tern_tq_inter) mode_flags |= 8U;
+    if (p->tern_tq && p->tern_tq_inter && !kf_burst) mode_flags |= 8U;
     if (p->tern_qpel) mode_flags |= 16U;
     if (p->tern_dither) mode_flags |= 64U;
     uint32_t eff_blocks = ((mode_flags & 1U) != 0U) ? ((p->tern_total_blocks + 1U) >> 1)
@@ -3100,7 +3147,13 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
     if (enc_cap_words > (p->tern_max_record_words & ~1U)) {
       enc_cap_words = p->tern_max_record_words & ~1U;
     }
-    uint32_t enc_thr = kf_resync ? 255U : (kf_burst ? 8U : p->tern_rc_threshold);
+    /* The start burst codes the rolling intra rows only (no deltas, no inter
+     * transform), like a resync burst: about half its cap, so nothing races
+     * for it. With deltas it ran far over the cap, whichever records got
+     * there first won, and what the losers left inside the deadzone set the
+     * quality of the following minutes (up to 3 dB on still content, 0.3 dB
+     * on a zoom), differently for every build of the shaders. */
+    uint32_t enc_thr = kf_burst ? 255U : p->tern_rc_threshold;
 
     tern_enc_cb_t ecb = {
         p->width, p->height, enc_thr, p->tern_delta_min,
@@ -3181,10 +3234,30 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
      * Unbind g_tile_mvs UAV (u1) and bind current frame's MVs as read-only SRV (t5). */
     ID3D11DeviceContext_CSSetUnorderedAccessViews(p->ctx, 1, 1, &no_uav, NULL);
     ID3D11DeviceContext_CSSetShaderResources(p->ctx, 5, 1, &p->tern_enc_mvs_srv[mv_cur]);
-    /* Pass 1b: CSIntraT (transform intra on 4x4 blocks; writes 0 flags when off) */
+    /* Pass 1b: transform on 4x4 blocks (writes 0 flags when off). Which
+     * blocks fit the budget is a set of prefix sums (see CSIntraTCount), so
+     * that it does not depend on GPU timing: what each block wants, two
+     * scans over per-group sums, the records, then the counter start. */
     ID3D11DeviceContext_CSSetUnorderedAccessViews(p->ctx, 5, 1, &p->tern_enc_tflag_uav, NULL);
+    {
+      UINT tq_zero[4] = {0, 0, 0, 0};
+      ID3D11DeviceContext_ClearUnorderedAccessViewUint(p->ctx, p->tern_tq_scratch_uav, tq_zero);
+    }
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(p->ctx, 6, 1, &p->tern_tq_scratch_uav, NULL);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(p->ctx, 7, 1, &p->tern_tq_stage_uav, NULL);
+    ID3D11DeviceContext_CSSetShader(p->ctx, p->tern_cs_intra_t_count, NULL, 0);
+    ID3D11DeviceContext_Dispatch(p->ctx, (p->tern_tq_blocks + 63U) / 64U, 1, 1);
+    ID3D11DeviceContext_CSSetShader(p->ctx, p->tern_cs_tq_scan_a, NULL, 0);
+    ID3D11DeviceContext_Dispatch(p->ctx, 1, 1, 1);
+    ID3D11DeviceContext_CSSetShader(p->ctx, p->tern_cs_tq_mid, NULL, 0);
+    ID3D11DeviceContext_Dispatch(p->ctx, (p->tern_tq_blocks + 63U) / 64U, 1, 1);
+    ID3D11DeviceContext_CSSetShader(p->ctx, p->tern_cs_tq_scan_v, NULL, 0);
+    ID3D11DeviceContext_Dispatch(p->ctx, 1, 1, 1);
     ID3D11DeviceContext_CSSetShader(p->ctx, p->tern_cs_intra_t, NULL, 0);
     ID3D11DeviceContext_Dispatch(p->ctx, (p->tern_tq_blocks + 63U) / 64U, 1, 1);
+    ID3D11DeviceContext_CSSetShader(p->ctx, p->tern_cs_tq_final, NULL, 0);
+    ID3D11DeviceContext_Dispatch(p->ctx, 1, 1, 1);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(p->ctx, 7, 1, &no_uav, NULL);
     ID3D11DeviceContext_CSSetUnorderedAccessViews(p->ctx, 5, 1, &no_uav, NULL);
     ID3D11DeviceContext_CSSetShaderResources(p->ctx, 8, 1, &p->tern_enc_tflag_srv);
     ID3D11DeviceContext_CSSetShader(p->ctx, p->tern_cs_encode, NULL, 0);
@@ -3192,6 +3265,8 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
     {
       ID3D11ShaderResourceView *null_t89[2] = {NULL, NULL};
       ID3D11DeviceContext_CSSetShaderResources(p->ctx, 8, 2, null_t89);
+      /* CSEncode reads the transform total from the scratch (u6) */
+      ID3D11DeviceContext_CSSetUnorderedAccessViews(p->ctx, 6, 1, &no_uav, NULL);
     }
 
     ID3D11ShaderResourceView *null_srv[8] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
@@ -3221,14 +3296,18 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
     wait_query_event(p->ctx, p->tern_readback_query[stg_idx]);
 
     D3D11_MAPPED_SUBRESOURCE mr = {0};
-    uint32_t raw_words = 0;
+    uint32_t raw_words = 0, refused_words = 0;
     if (SUCCEEDED(map_read_nonblocking(p->ctx, (ID3D11Resource *)p->tern_out_counter_stg[stg_idx], &mr))) {
-      raw_words = *(const uint32_t *)mr.pData;
+      raw_words = ((const uint32_t *)mr.pData)[0];
+      refused_words = ((const uint32_t *)mr.pData)[1];
       ID3D11DeviceContext_Unmap(p->ctx, (ID3D11Resource *)p->tern_out_counter_stg[stg_idx], 0);
     }
     uint32_t record_words = (raw_words > enc_cap_words) ? enc_cap_words : raw_words;
     record_words &= ~1U;
     p->tern_last_raw_words = record_words;
+    /* From here on raw_words is what the frame wanted, refused transform
+     * blocks included: what the rate control sizes. */
+    raw_words += refused_words;
 
 
     /* Compact MVs: 0 bytes if all (0,0), else 2 bytes/tile (int8 dx, int8 dy) */
@@ -3264,7 +3343,15 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
     memcpy(p->enc_out_buf + sizeof(uint32_t), &mv_bytes, sizeof(uint32_t));
 
     /* Closed-loop frame rate controller (skip initial 16-frame convergence burst) */
-    p->tern_static_scene = (mv_bytes == 0U && raw_words < (target_words / 2U));
+    /* Entered under half the budget, kept while nothing moves and the frame
+     * stays within the budget: a still scene's refresh window makes its own
+     * frames larger, and leaving "static" on the first of them switched the
+     * window off every other frame. */
+    if (mv_bytes != 0U || raw_words > target_words) {
+      p->tern_static_scene = false;
+    } else if (raw_words < (target_words / 2U)) {
+      p->tern_static_scene = true;
+    }
     if (!kf_burst) {
       /* The transform has its own qp loop: coarser while frames exceed the
        * budget, finer while they leave room. Tying it to the delta threshold
@@ -3276,6 +3363,7 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
         if (p->tern_tq_qp > TERN_TQ_QP_MIN) p->tern_tq_qp--;
       }
     }
+    if (raw_words >= (target_words >> 1)) p->tern_rc_2x_calm = 0U;
     if (!kf_burst) {
       /* The 8-bit refresh doubles what a refreshed row costs: only with a
        * wide margin, and dropped again well before the budget is reached. */
@@ -3316,7 +3404,10 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
         if (p->tern_rc_intra_err_thr < ierr_floor) p->tern_rc_intra_err_thr = ierr_floor;
       }
       if (p->tern_rc_2x && raw_words < (target_words >> 1)) {
-        p->tern_rc_2x = false;
+        if (++p->tern_rc_2x_calm >= TERN_RC_2X_CALM) {
+          p->tern_rc_2x = false;
+          p->tern_rc_2x_calm = 0U;
+        }
       }
     }
     }
