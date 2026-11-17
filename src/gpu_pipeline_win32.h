@@ -62,6 +62,65 @@ void gpu_pipeline_set_bitrate(gpu_pipeline_t *pipe, uint32_t bitrate_bps);
 
 void gpu_pipeline_force_synth(gpu_pipeline_t *pipe, bool enable);
 
+void gpu_pipeline_ternary_request_keyframe(gpu_pipeline_t *pipe);
+
+/**
+ * Makes the ternary encoder emit its compact bitstream: records sorted and
+ * gap-coded, vectors run-length coded. Lossless, roughly half the bytes, and
+ * the rate control spends the saving on more records. The decoder recognises
+ * either format on its own. Off by default: the raw layout
+ * [u32 record_words][u32 mv_bytes][mvs][records] is what the benches slice.
+ */
+void gpu_pipeline_ternary_set_packed(gpu_pipeline_t *pipe, bool enable);
+
+/**
+ * With the compact bitstream on, also range-codes the records (adaptive
+ * contexts, see tern_ec_pack_records): still lossless, and a record then
+ * costs what its trits are worth, so the same bitrate carries about twice as
+ * many. The coder takes a bounded share of the frame period: records it has
+ * no time for follow in the plain compact layout, in the same frame.
+ */
+void gpu_pipeline_ternary_set_entropy(gpu_pipeline_t *pipe, bool enable);
+
+/**
+ * Codes intra (rolling refresh, disocclusion) with a 4x4 integer transform
+ * instead of raw samples. Needs a decoder built with CSITrans: streams that
+ * use it are marked in the frame header (packed layouts gain a 9th class).
+ */
+void gpu_pipeline_ternary_set_transform(gpu_pipeline_t *pipe, bool enable);
+
+/**
+ * With the transform on, also transform-codes blocks whose motion-compensated
+ * residual is large (zoom, rotation, motion inside a tile) instead of leaving
+ * them to converge over several frames of ternary deltas.
+ */
+void gpu_pipeline_ternary_set_transform_inter(gpu_pipeline_t *pipe, bool enable);
+
+/**
+ * Tile vectors in quarter pels (bilinear motion compensation, integer and
+ * bit-exact on both sides). Marked in the stream by a byte after the
+ * vectors; a decoder built before it would apply them as whole pels.
+ */
+void gpu_pipeline_ternary_set_qpel(gpu_pipeline_t *pipe, bool enable);
+
+/**
+ * Ordered (Bayer 4x4) dither instead of rounding when the rolling refresh
+ * falls back to 6-bit samples: no banding on gradients, at the price of fine
+ * noise (about 2.6 dB of PSNR on the bench pattern). Encoder only, off by
+ * default.
+ */
+void gpu_pipeline_ternary_set_dither(gpu_pipeline_t *pipe, bool enable);
+
+/**
+ * Record words per frame this pipeline can range-decode within its share of
+ * the frame period, from what decoding has cost it so far. A receiver sends
+ * it to the sender, which passes it to gpu_pipeline_ternary_set_entropy_limit
+ * so that it never range-codes more than the receiver can follow (0 = no
+ * limit). Records past the limit still travel, in the plain compact layout.
+ */
+uint32_t gpu_pipeline_ternary_entropy_budget(gpu_pipeline_t *pipe);
+void gpu_pipeline_ternary_set_entropy_limit(gpu_pipeline_t *pipe, uint32_t record_words);
+
 void gpu_pipeline_destroy(gpu_pipeline_t *pipe);
 
 /** Captures (or GPU-renders) one frame in VRAM and encodes it to H.264. */

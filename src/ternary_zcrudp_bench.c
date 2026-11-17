@@ -42,14 +42,21 @@ int main(int argc, char **argv) {
   bool measure_psnr = false;
   bool enable_rio = true;
   bool force_synth = false;
+  bool use_qpel = true;
+  bool use_transform = true;
+  uint32_t max_resend = 8;
+  uint64_t resent_rounds = 0;
   zc_net_impair_t impair = {0};
 
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "--live") == 0) show_window = true;
     else if (strcmp(argv[i], "--psnr") == 0) measure_psnr = true;
     else if (strcmp(argv[i], "--synth") == 0) force_synth = true;
+    else if (strcmp(argv[i], "--no-qpel") == 0) use_qpel = false;
+    else if (strcmp(argv[i], "--no-transform") == 0) use_transform = false;
     else if (strcmp(argv[i], "--no-rio") == 0) enable_rio = false;
     else if (strcmp(argv[i], "--no-fec") == 0) fec_shards = 0;
+    else if (strcmp(argv[i], "--resend") == 0 && i + 1 < argc) max_resend = (uint32_t)atoi(argv[++i]);
     else if (strcmp(argv[i], "--fec") == 0 && i + 1 < argc) fec_shards = (uint8_t)atoi(argv[++i]);
     else if (strcmp(argv[i], "--loss") == 0 && i + 1 < argc) impair.loss_pct = atoi(argv[++i]);
     else if (strcmp(argv[i], "--burst") == 0 && i + 2 < argc) {
@@ -134,6 +141,9 @@ int main(int argc, char **argv) {
   }
   gpu_pipeline_set_bitrate(gpu, bitrate_bps);
   if (force_synth) gpu_pipeline_force_synth(gpu, true);
+  gpu_pipeline_ternary_set_qpel(gpu, use_qpel);
+  gpu_pipeline_ternary_set_transform(gpu, use_transform);
+  gpu_pipeline_ternary_set_transform_inter(gpu, use_transform);
 
   zc_video_tx_t *tx = (zc_video_tx_t *)calloc(1, sizeof(*tx));
   zc_video_rx_t *rx = (zc_video_rx_t *)calloc(1, sizeof(*rx));
@@ -145,6 +155,11 @@ int main(int argc, char **argv) {
     fprintf(stderr, "zcrudp video bridge init failed\n");
     return 1;
   }
+
+  /* The vectors and the records of a video frame travel as two transport
+   * frames that may complete in either order: take both. Datagrams of other
+   * video frames are filtered below on the ternary header. */
+  rx->allow_out_of_order = true;
 
   if (want_rio) {
     /* A socket created with WSA_FLAG_REGISTERED_IO is only driven through
@@ -186,13 +201,14 @@ int main(int argc, char **argv) {
 
   size_t wire_cap = ZCRUDP_TERNARY_PKT_HDR_SZ + 20U * 1024U * 1024U;
   uint8_t *wire_buf = (uint8_t *)malloc(wire_cap);
+  uint8_t *rx_frame_buf = (uint8_t *)malloc(wire_cap); /* frame as received */
   uint8_t rx_pkt[2048];
   /* Slices are capped at 280 words under impairment; 1 slice otherwise. */
   const uint32_t impaired_words_per_pkt = 280U;
   size_t slice_seen_cap = wire_cap / (impaired_words_per_pkt * sizeof(uint32_t)) + 1U;
   uint8_t *slice_seen = (uint8_t *)malloc(slice_seen_cap);
   if (!cap_arr || !enc_arr || !ntx_arr || !nrx_arr || !dec_arr || !prs_arr ||
-      !tot_arr || (measure_psnr && !psnr_arr) || !wire_buf || !slice_seen) {
+      !tot_arr || (measure_psnr && !psnr_arr) || !wire_buf || !rx_frame_buf || !slice_seen) {
     fprintf(stderr, "out of memory\n");
     return 1;
   }
@@ -201,6 +217,10 @@ int main(int argc, char **argv) {
   size_t total_bytes = 0;
   size_t sent_frames = 0;
   const uint32_t warmup = 30;
+  zc_rate_budget_t rate_budget;
+  zc_rate_budget_init(&rate_budget, tx, bitrate_bps);
+  uint32_t slice_frags = 4U;   /* transport fragments per protected slice */
+  uint32_t slice_miss_q8 = 20U;
 
   for (uint32_t f = 0; f < (uint32_t)(num_frames + warmup); ++f) {
     if (show_window && !gpu_pipeline_pump_events(gpu)) break;
@@ -230,11 +250,30 @@ int main(int argc, char **argv) {
     const uint8_t *mv_ptr = bs + 8U;
     const uint8_t *rec_ptr = bs + 8U + mv_bytes; /* uint32 words, unaligned */
 
-    const bool use_fec_frame = (has_impair && fec_shards > 0 && (f >= 16U || (impair.reorder_pct == 0 && impair.jitter_us == 0)));
+    /* Under impairment the records go as small FEC-protected slices, each
+     * decodable on its own: what the link loses beyond the parity costs
+     * those slices only, never the frame. The receiver reassembles them
+     * side by side, so delay and reordering no longer call for one big
+     * frame (which a single unrecovered datagram used to void entirely). */
+    /* On a link that delays or reorders, a frame too large for that (the
+     * start-up burst) would have more slices in flight than the receiver
+     * reassembles at once: it goes as unprotected single-datagram slices,
+     * which need no reassembly, and relies on the retransmission below. */
+    const bool in_order = (impair.reorder_pct == 0 && impair.jitter_us == 0 &&
+                           impair.dup_pct == 0);
+    /* A protected slice fills exactly slice_frags transport fragments, so
+     * no datagram travels half empty, and carries fec_shards parity
+     * fragments: the overhead is fec_shards / slice_frags. slice_frags
+     * follows the loss measured on the first transmission (see below):
+     * long slices while few are hit, short ones when many are. */
+    /* Whole records (2 words) only: slices are appended in arrival order. */
+    const uint32_t fec_words =
+        (slice_frags * (ZC_FRAG_MTU / 4U) - (ZCRUDP_TERNARY_PKT_HDR_SZ + 3U) / 4U) & ~1U;
+    const bool use_fec_frame =
+        (has_impair && fec_shards > 0 &&
+         (in_order || record_words / fec_words < (ZC_RX_SLOTS * 3U) / 4U));
     const uint32_t max_words_per_pkt = use_fec_frame
-                                           ? ((impair.reorder_pct > 0 || impair.jitter_us > 0)
-                                                  ? (record_words > 0 ? record_words : 1U)
-                                                  : ((uint32_t)fec_shards * 420U))
+                                           ? fec_words
                                            : (has_impair ? impaired_words_per_pkt
                                                          : (record_words > 0 ? record_words : 1U));
     uint32_t num_slices = (record_words == 0) ? 0U : ((record_words + max_words_per_pkt - 1U) / max_words_per_pkt);
@@ -242,11 +281,28 @@ int main(int argc, char **argv) {
     if (num_slices > 2047U || num_slices > slice_seen_cap) continue;
     memset(slice_seen, 0, num_slices);
 
-    uint64_t t_tx0 = qpc_now_us();
     size_t frame_wire_bytes = 0;
+    const uint64_t wire_bytes_before = tx->bytes_sent;
+    bool got_mv = false;
+    uint32_t rx_mv_bytes = 0;
+    uint32_t rx_record_words = 0;
+    uint32_t rx_slices = 0;
+    uint32_t expected_slices = num_slices;
+    uint8_t *rx_dec_buf = rx_frame_buf;
+    uint8_t *rx_rec_dst = rx_dec_buf + 8U + mv_bytes;
+    uint64_t tx_us = 0, rx_us = 0;
+
+    /* What the link lost beyond the parity is sent again, up to
+     * max_resend times: the receiver here simply knows what it is missing,
+     * where a real one would send that list back. Every round costs a
+     * round trip, which the latency rows below include. */
+    const uint32_t rounds = has_impair ? (1U + max_resend) : 1U;
+    for (uint32_t round = 0; round < rounds; ++round) {
+    if (round > 0) resent_rounds++;
+    uint64_t t_tx0 = qpc_now_us();
 
     /* 1) Send Tile MVs on RELIABLE_FEC channel */
-    {
+    if (!got_mv) {
       zcrudp_ternary_pkt_hdr_t mvhdr = {
           .magic = ZCRUDP_TERNARY_PKT_MAGIC,
           .pixfmt = ZCRUDP_TERNARY_MAKE_PF(ZCRUDP_TERNARY_FMT_GRAY8,
@@ -266,6 +322,7 @@ int main(int argc, char **argv) {
 
     /* 2) Send record slices on UNRELIABLE_RIO channel (independent 1-UDP-pkt slices) */
     for (uint32_t s = 0; s < num_slices; ++s) {
+      if (slice_seen[s]) continue; /* resend rounds: only what is missing */
       uint32_t off = s * max_words_per_pkt;
       uint32_t wcnt = record_words - off;
       if (wcnt > max_words_per_pkt) wcnt = max_words_per_pkt;
@@ -289,22 +346,30 @@ int main(int argc, char **argv) {
                                       f * 2048U + 1U + s, wire_buf, d_wire_len, t_tx0, has_impair);
     }
     uint64_t t_tx1 = qpc_now_us();
+    tx_us += t_tx1 - t_tx0;
 
     /* Receive MVs + independent slices until frame complete or deadline */
-    bool got_mv = false;
-    uint32_t rx_mv_bytes = 0;
-    uint32_t rx_record_words = 0;
-    uint32_t rx_slices = 0;
-    uint32_t expected_slices = num_slices;
-    uint8_t *rx_dec_buf = wire_buf;
-    uint8_t *rx_rec_dst = rx_dec_buf + 8U + mv_bytes;
-
     uint64_t t_rx0 = qpc_now_us();
     uint64_t last_rx_us = t_rx0;
     uint64_t wait_deadline = t_rx0 + ((has_impair || keyframe || f < 16U) ? 50000ULL : 10000ULL);
-    uint64_t idle_grace_us = has_impair ? ((uint64_t)impair.base_owd_us + (uint64_t)impair.jitter_us + 800ULL) : 200ULL;
+    /* Longest a datagram of this frame can still be on its way: base delay
+     * and jitter, plus the simulator's reorder (up to 7.5 ms) and duplicate
+     * (0.2 ms) delays. Giving up sooner loses packets the link delivered. */
+    uint64_t idle_grace_us = has_impair
+                                 ? ((uint64_t)impair.base_owd_us + (uint64_t)impair.jitter_us +
+                                    (impair.reorder_pct > 0 ? 7500ULL : 0ULL) + 1000ULL)
+                                 : 200ULL;
 
+    /* A resend does not wait for the stragglers the link merely delayed
+     * out of order: past the ordinary transit time, what is missing is asked
+     * for again at once, and whichever copy arrives first is used. Only the
+     * last round waits everything out. */
+    const uint64_t early_us = (uint64_t)impair.base_owd_us + (uint64_t)impair.jitter_us + 1500ULL;
     while (qpc_now_us() < wait_deadline) {
+      if (round + 1U < rounds && qpc_now_us() - t_rx0 > early_us &&
+          !(got_mv && rx_slices >= num_slices)) {
+        break;
+      }
       if (has_impair) {
         zc_video_tx_flush_net(tx, (uintptr_t)tx_sock, &bind_addr, addr_len,
                               qpc_now_us());
@@ -356,7 +421,32 @@ int main(int argc, char **argv) {
         Sleep(0);
       }
     }
-    uint64_t t_rx1 = qpc_now_us();
+    rx_us += qpc_now_us() - t_rx0;
+    if (round == 0U && use_fec_frame && num_slices >= 2U) {
+      /* Share of slices the parity could not save on their first trip. */
+      uint32_t missed = num_slices - ((rx_slices < num_slices) ? rx_slices : num_slices);
+      uint32_t miss_q8 = (missed * 256U) / num_slices;
+      slice_miss_q8 = (slice_miss_q8 * 7U + miss_q8) / 8U;
+      if (slice_miss_q8 > 38U && slice_frags > 1U) {        /* > 15 % */
+        slice_frags >>= 1;
+        slice_miss_q8 = 20U;
+      } else if (slice_miss_q8 < 8U && slice_frags < 8U) {  /* < 3 % */
+        slice_frags <<= 1;
+        slice_miss_q8 = 20U;
+      }
+    }
+    if (got_mv && rx_slices >= num_slices) break;
+    } /* resend rounds */
+    /* The encoder gets what is left of the link once headers, parity and
+     * resends are paid for. */
+    gpu_pipeline_set_bitrate(gpu, zc_rate_budget_update(&rate_budget, tx, bs_len));
+
+    if (tx->bytes_sent > wire_bytes_before) {
+      uint64_t owd_us = (tx_us + rx_us) / 2ULL;
+      if (owd_us == 0ULL) owd_us = 1ULL;
+      zc_video_tx_on_ack(tx, (uint32_t)owd_us,
+                         (uint32_t)(tx->bytes_sent - wire_bytes_before), 0U);
+    }
 
     if (got_mv || rx_slices > 0) {
       if (!got_mv) {
@@ -373,8 +463,8 @@ int main(int argc, char **argv) {
       if (drc == 0 && f >= warmup && measured < num_frames) {
         cap_arr[measured] = cap_us;
         enc_arr[measured] = enc_us;
-        ntx_arr[measured] = (double)(t_tx1 - t_tx0);
-        nrx_arr[measured] = (double)(t_rx1 - t_rx0);
+        ntx_arr[measured] = (double)tx_us;
+        nrx_arr[measured] = (double)rx_us;
         dec_arr[measured] = dec_us;
         prs_arr[measured] = prs_us;
         tot_arr[measured] = cap_us + enc_us + ntx_arr[measured] +
@@ -385,6 +475,9 @@ int main(int argc, char **argv) {
             psnr_arr[measured] = pdb;
           }
         }
+        /* Everything that went on the wire for this frame: fragment headers,
+         * FEC parity and resends included, not just the record payload. */
+        frame_wire_bytes = (size_t)(tx->bytes_sent - wire_bytes_before);
         total_bytes += frame_wire_bytes;
         measured++;
       }
@@ -402,6 +495,10 @@ int main(int argc, char **argv) {
          (unsigned long long)tx->packets_duplicated_sim,
          (unsigned long long)tx->fec_packets_sent,
          (unsigned long long)tx->send_errors);
+  if (has_impair) {
+    printf("Resend rounds  : %llu over %zu frames (at most %u per frame), slices of %u fragments at the end\n",
+           (unsigned long long)resent_rounds, sent_frames, max_resend, slice_frags);
+  }
   if (measured > 0) {
     double avg_mbps = ((double)total_bytes * 8.0 * (double)fps) /
                       ((double)measured * 1000000.0);
@@ -431,6 +528,7 @@ int main(int argc, char **argv) {
 
   free(slice_seen);
   free(wire_buf);
+  free(rx_frame_buf);
   free(cap_arr);
   free(enc_arr);
   free(ntx_arr);
@@ -439,13 +537,14 @@ int main(int argc, char **argv) {
   free(prs_arr);
   free(tot_arr);
   free(psnr_arr);
+  bool had_rio = tx->rio_ready;
   zc_video_rx_destroy(rx);
   zc_video_tx_destroy(tx);
   free(rx);
   free(tx);
   gpu_pipeline_destroy(gpu);
   closesocket(rx_sock);
-  closesocket(tx_sock);
+  if (!had_rio) closesocket(tx_sock);
   WSACleanup();
   timeEndPeriod(1);
   return 0;

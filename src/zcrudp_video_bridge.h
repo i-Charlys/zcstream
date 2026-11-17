@@ -62,6 +62,17 @@ typedef struct {
 
 #define ZC_NET_QUEUE_CAP 2048U
 
+/* A frame the transmitter keeps so that lost fragments can be sent again. */
+typedef struct {
+  bool valid;
+  bool keyframe;
+  uint8_t fec_shards;
+  uint32_t frame_id;
+  size_t len;
+  size_t cap;
+  uint8_t *data;
+} zc_tx_history_t;
+
 typedef struct {
   uint8_t *pool_backing;
   size_t pool_pages;
@@ -82,30 +93,71 @@ typedef struct {
   /* Optional Winsock RIO batch TX state (host-side OS I/O, outside zcrudp) */
   bool rio_ready;
   void *rio_state;
+  /* Retransmission history (zc_video_tx_enable_history), a ring by frame id */
+  zc_tx_history_t *history;
+  uint32_t history_frames;
+  uint64_t frags_resent;
+  uint64_t resend_misses; /* fragments asked for a frame no longer kept */
 } zc_video_tx_t;
 
+/* Frames being reassembled at the same time. Jitter and reordering interleave
+ * the datagrams of consecutive frames: with a single slot, the first datagram
+ * of a newer frame threw away an older one that was a datagram short. */
+#define ZC_RX_SLOTS 32U
+#define ZC_RX_RECENT 64U
+
 typedef struct {
-  uint32_t active_frame_id;
-  uint32_t last_completed_frame_id;
+  bool used;
+  uint32_t frame_id;
   uint16_t total_frags;
   uint16_t tail_len;
   uint16_t received_data_frags;
+  uint16_t highest_frag_seen;
   uint8_t flags;
   uint8_t parity_received_count;
   uint16_t parity_lens[ZC_MAX_PARITY_SHARDS];
   uint8_t parity_present[ZC_MAX_PARITY_SHARDS];
-  uint16_t frag_lens[ZC_MAX_FRAGS_PER_FRAME];
-  uint8_t frag_present[ZC_MAX_FRAGS_PER_FRAME];
-  uint8_t *frame_buf;   /* Caller-owned contiguous output buffer */
+  bool complete;         /* ordered mode: whole, waiting for its turn */
+  bool fec_used;
+  uint64_t first_us;     /* when the slot was opened */
+  uint64_t last_rx_us;   /* last datagram of this frame, 0 = none yet */
+  uint64_t complete_us;
+  uint64_t last_nack_us; /* 0 = never asked for */
+  uint16_t *frag_lens;   /* ZC_MAX_FRAGS_PER_FRAME entries */
+  uint8_t *frag_present; /* ZC_MAX_FRAGS_PER_FRAME entries */
+  uint8_t *buf;          /* frame_cap bytes reserved, buf_committed of them usable */
+  size_t buf_committed;
+  uint8_t *parity_buf;   /* ZC_MAX_PARITY_SHARDS * ZC_FRAG_MTU */
+} zc_video_rx_slot_t;
+
+typedef struct {
+  zc_video_rx_slot_t slots[ZC_RX_SLOTS];
+  uint32_t last_completed_frame_id;
+  /* false (default): frames are delivered in increasing id order only, and
+   * completing one gives up on the older ones still in reassembly.
+   * true: every frame is delivered when it completes, whatever the order
+   * (for callers whose frames are independent). */
+  bool allow_out_of_order;
+  /* Ordered mode (zc_video_rx_set_ordered): frames are handed out by
+   * zc_video_rx_next in id order, a missing one being waited for (and asked
+   * for again, zc_video_rx_build_nack) for hold_us before it is given up. */
+  bool ordered;
+  uint64_t hold_us;
+  uint64_t nack_delay_us;
+  uint64_t nack_interval_us;
+  uint64_t now_us;        /* zc_video_rx_tick */
+  uint64_t nacks_built;
+  uint32_t recent_ids[ZC_RX_RECENT]; /* frames already delivered */
+  uint32_t recent_count;
+  uint32_t recent_pos;
+  uint8_t *frame_buf;   /* The frame delivered by the last feed that returned 1 */
   size_t frame_cap;
-  uint8_t *parity_buf;  /* ZC_MAX_PARITY_SHARDS * ZC_FRAG_MTU */
   uint8_t slice_buf[ZC_FRAG_MTU]; /* Last slice from zc_video_rx_feed_slice */
   uint64_t frames_completed;
   uint64_t frames_fec_recovered;
   uint64_t frames_dropped;
   uint64_t dup_packets_ignored;
   uint64_t ooo_packets_seen;
-  uint16_t highest_frag_seen;
 } zc_video_rx_t;
 
 int zc_video_tx_init(zc_video_tx_t *tx, size_t pool_pages,
@@ -136,7 +188,78 @@ int zc_video_tx_flush_net(zc_video_tx_t *tx, uintptr_t udp_sock,
                           const void *dst_addr, int dst_addr_len,
                           uint64_t now_us);
 
+/**
+ * Keeps a copy of the last `frames` frames sent (ids are expected to be
+ * consecutive) so that zc_video_tx_resend can answer retransmission requests.
+ */
+int zc_video_tx_enable_history(zc_video_tx_t *tx, uint32_t frames);
+
+/**
+ * Sends again data fragments of a frame still in the history: the `count`
+ * indices in `frags`, or every data fragment when count is 0. Returns the
+ * number of fragments sent, 0 when the frame is no longer kept.
+ */
+int zc_video_tx_resend(zc_video_tx_t *tx, uintptr_t udp_sock,
+                       const void *dst_addr, int dst_addr_len,
+                       uint32_t frame_id, const uint16_t *frags, uint16_t count,
+                       uint64_t now_us, bool apply_impair);
+
+/**
+ * Feeds an OWD + acked-bytes sample back into the SCReAM/L4S pacer.
+ */
+void zc_video_tx_on_ack(zc_video_tx_t *tx, uint32_t owd_us,
+                        uint32_t acked_bytes, uint8_t ce_marked);
+
+/** Retransmission request: "ZCNK", u32 frame id, u16 count, count x u16
+ *  fragment indices (count 0 = the whole frame). Little endian. */
+#define ZC_NACK_MAGIC "ZCNK"
+#define ZC_NACK_HDR_SZ 10U
+#define ZC_NACK_MAX_FRAGS 512U
+
+/**
+ * Splits a link budget between video and what carrying it costs. Fragment
+ * headers, FEC parity and retransmissions all ride on the same link, so a
+ * video encoder sized to the full link rate overshoots it as soon as the link
+ * loses packets. Call zc_rate_budget_update once per frame sent, with the
+ * video bytes of that frame: it returns the rate to give the encoder.
+ */
+typedef struct {
+  uint32_t link_bps;   /* what the link may carry, everything included */
+  uint32_t ratio_q16;  /* video bytes per wire byte, running average (Q16) */
+  uint64_t wire_mark;  /* tx->bytes_sent at the previous update */
+  uint64_t video_acc;  /* video bytes since the last sample */
+} zc_rate_budget_t;
+
+void zc_rate_budget_init(zc_rate_budget_t *rb, const zc_video_tx_t *tx, uint32_t link_bps);
+uint32_t zc_rate_budget_update(zc_rate_budget_t *rb, const zc_video_tx_t *tx,
+                               size_t video_bytes);
+
 int zc_video_rx_init(zc_video_rx_t *rx, size_t max_frame_bytes);
+
+/**
+ * Switches the receiver to ordered delivery with retransmission requests.
+ * zc_video_rx_feed then only takes datagrams in (it returns 0 or an error);
+ * frames come out of zc_video_rx_next, and the caller sends what
+ * zc_video_rx_build_nack produces back to the sender.
+ *  hold_us           how long a missing or incomplete frame is waited for
+ *  nack_delay_us     age at which an incomplete frame is first asked for
+ *  nack_interval_us  time between two requests for the same frame
+ */
+void zc_video_rx_set_ordered(zc_video_rx_t *rx, uint64_t hold_us,
+                             uint64_t nack_delay_us, uint64_t nack_interval_us);
+
+/** Current time, for the ordered mode timers. Call before feed/next/build_nack. */
+void zc_video_rx_tick(zc_video_rx_t *rx, uint64_t now_us);
+
+/** Ordered mode: next frame in id order, if ready. Returns 1 and fills the
+ *  outputs (data in rx->frame_buf, valid until the next call), else 0. */
+int zc_video_rx_next(zc_video_rx_t *rx, size_t *out_len, uint32_t *out_frame_id,
+                     bool *out_keyframe, bool *out_fec_used);
+
+/** Ordered mode: writes one retransmission request into buf (at least
+ *  ZC_NACK_HDR_SZ + 2 * ZC_NACK_MAX_FRAGS bytes) and returns its size, or 0
+ *  when nothing is due. Call until it returns 0. */
+size_t zc_video_rx_build_nack(zc_video_rx_t *rx, uint8_t *buf, size_t cap);
 void zc_video_rx_destroy(zc_video_rx_t *rx);
 
 int zc_video_rx_feed(zc_video_rx_t *rx, const uint8_t *pkt, size_t pkt_len,

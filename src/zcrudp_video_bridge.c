@@ -68,6 +68,7 @@ typedef struct {
 
 typedef struct {
   ZC_RIO_FN fn;
+  SOCKET sock;
   ZC_RIO_BUFFERID buf_id;
   ZC_RIO_CQ cq;
   ZC_RIO_RQ rq;
@@ -214,6 +215,7 @@ int zc_video_tx_enable_rio(zc_video_tx_t *tx, uintptr_t connected_udp_sock) {
     return -5;
   }
 
+  rs->sock = sock;
   rs->ring_cap = pool_bytes;
   rs->ring_cursor = 0;
   tx->rio_state = rs;
@@ -221,11 +223,57 @@ int zc_video_tx_enable_rio(zc_video_tx_t *tx, uintptr_t connected_udp_sock) {
   return 0;
 }
 
+static void rio_reap(zc_video_tx_t *tx, zc_rio_state_t *rs) {
+  ZC_RIORESULT results[256];
+  ULONG done;
+  while ((done = rs->fn.RIODequeueCompletion(rs->cq, results, 256)) > 0 &&
+         done != (ULONG)-1 /* RIO_CORRUPT_CQ */) {
+    for (ULONG i = 0; i < done; ++i) {
+      if (results[i].Status != 0 && tx) {
+        tx->send_errors++;
+      }
+    }
+    rs->inflight = (rs->inflight >= done) ? (rs->inflight - done) : 0;
+  }
+  if (done == (ULONG)-1 && tx) {
+    tx->send_errors++;
+  }
+}
+
+/* Rings the kernel doorbell once for every send queued with RIO_MSG_DEFER. */
+static void rio_commit(zc_video_tx_t *tx, zc_rio_state_t *rs) {
+  if (rs->deferred) {
+    if (!rs->fn.RIOSend(rs->rq, NULL, 0, ZC_RIO_MSG_COMMIT_ONLY, NULL)) {
+      if (tx) tx->send_errors++;
+    }
+    rs->deferred = false;
+  }
+}
+
 void zc_video_tx_destroy(zc_video_tx_t *tx) {
   if (!tx) return;
+  if (tx->history) {
+    for (uint32_t i = 0; i < tx->history_frames; ++i) free(tx->history[i].data);
+    free(tx->history);
+    tx->history = NULL;
+    tx->history_frames = 0;
+  }
   if (tx->rio_state) {
     zc_rio_state_t *rs = (zc_rio_state_t *)tx->rio_state;
-    if (rs->cq) rs->fn.RIOCloseCompletionQueue(rs->cq);
+    for (unsigned spin = 0; rs->inflight > 0 && spin < 20000U; ++spin) {
+      rio_commit(tx, rs);
+      rio_reap(tx, rs);
+      if (rs->inflight == 0) break;
+      SwitchToThread();
+    }
+    if (rs->sock != INVALID_SOCKET) {
+      closesocket(rs->sock);
+      rs->sock = INVALID_SOCKET;
+    }
+    if (rs->cq) {
+      rio_reap(tx, rs);
+      rs->fn.RIOCloseCompletionQueue(rs->cq);
+    }
     if (rs->buf_id && rs->buf_id != ZC_RIO_INVALID_BUFID) {
       rs->fn.RIODeregisterBuffer(rs->buf_id);
     }
@@ -237,23 +285,6 @@ void zc_video_tx_destroy(zc_video_tx_t *tx) {
     VirtualUnlock(tx->pool_backing, tx->pool_pages * RUDP_PAGE_SIZE);
     VirtualFree(tx->pool_backing, 0, MEM_RELEASE);
     tx->pool_backing = NULL;
-  }
-}
-
-static void rio_reap(zc_rio_state_t *rs) {
-  ZC_RIORESULT results[256];
-  ULONG done;
-  while ((done = rs->fn.RIODequeueCompletion(rs->cq, results, 256)) > 0 &&
-         done != (ULONG)-1 /* RIO_CORRUPT_CQ */) {
-    rs->inflight = (rs->inflight >= done) ? (rs->inflight - done) : 0;
-  }
-}
-
-/* Rings the kernel doorbell once for every send queued with RIO_MSG_DEFER. */
-static void rio_commit(zc_rio_state_t *rs) {
-  if (rs->deferred) {
-    (void)rs->fn.RIOSend(rs->rq, NULL, 0, ZC_RIO_MSG_COMMIT_ONLY, NULL);
-    rs->deferred = false;
   }
 }
 
@@ -271,8 +302,8 @@ static bool rio_queue_datagram(zc_video_tx_t *tx, const uint8_t *hdr,
   uint32_t window = (ring_slots - 1U < ZC_RIO_MAX_OUTSTANDING)
       ? ring_slots - 1U : ZC_RIO_MAX_OUTSTANDING;
   for (unsigned spin = 0; rs->inflight >= window; ++spin) {
-    rio_commit(rs);
-    rio_reap(rs);
+    rio_commit(tx, rs);
+    rio_reap(tx, rs);
     if (rs->inflight < window) break;
     if (spin > 20000U) return false;
     SwitchToThread();
@@ -287,7 +318,10 @@ static bool rio_queue_datagram(zc_video_tx_t *tx, const uint8_t *hdr,
   rb.BufferId = rs->buf_id;
   rb.Offset = rs->ring_cursor;
   rb.Length = pkt_bytes;
-  if (!rs->fn.RIOSend(rs->rq, &rb, 1, ZC_RIO_MSG_DEFER, NULL)) return false;
+  if (!rs->fn.RIOSend(rs->rq, &rb, 1, ZC_RIO_MSG_DEFER, NULL)) {
+    rio_commit(tx, rs);
+    return false;
+  }
 
   rs->deferred = true;
   rs->inflight++;
@@ -334,9 +368,48 @@ static bool tx_emit(zc_video_tx_t *tx, SOCKET sock, const struct sockaddr *dst,
 static void tx_flush(zc_video_tx_t *tx) {
   if (tx->rio_ready) {
     zc_rio_state_t *rs = (zc_rio_state_t *)tx->rio_state;
-    rio_commit(rs);
-    rio_reap(rs);
+    rio_commit(tx, rs);
+    rio_reap(tx, rs);
   }
+}
+
+static uint64_t bridge_now_us(void) {
+  LARGE_INTEGER f, c;
+  QueryPerformanceFrequency(&f);
+  QueryPerformanceCounter(&c);
+  return (uint64_t)((c.QuadPart * 1000000LL) / f.QuadPart);
+}
+
+/* Refill tokens, pace when token-limited, and charge wire_bytes (including
+ * parity shards and resends) against the SCReAM/L4S pacer budget. */
+static void tx_pace_packet(zc_video_tx_t *tx, uint32_t wire_bytes,
+                           uint64_t *cur_us) {
+  if (!tx || wire_bytes == 0U || tx->pacer.rate_bytes_per_sec == 0U) return;
+  bool can = rudp_pacer_refill_and_can_send(&tx->pacer, *cur_us, wire_bytes);
+  if (!can && !tx->pacer.owd_initialized &&
+      (uint64_t)tx->pacer.inflight_bytes + wire_bytes > tx->pacer.cwnd_bytes) {
+    /* Callers without an ACK/OWD feedback loop cannot drain inflight_bytes. */
+    tx->pacer.inflight_bytes = 0U;
+    can = rudp_pacer_refill_and_can_send(&tx->pacer, *cur_us, wire_bytes);
+  }
+  if (!can) {
+    uint32_t wait_us = rudp_pacer_next_wait_us(&tx->pacer, wire_bytes);
+    if (wait_us > 0U && wait_us != UINT32_MAX) {
+      tx_flush(tx);
+      if (wait_us > 50000U) wait_us = 50000U;
+      uint64_t t0 = bridge_now_us();
+      if (wait_us >= 2000U) {
+        Sleep(wait_us / 1000U);
+      }
+      while (bridge_now_us() - t0 < wait_us) {
+        YieldProcessor();
+      }
+      uint64_t elapsed = bridge_now_us() - t0;
+      *cur_us += (elapsed > 0U) ? elapsed : wait_us;
+      (void)rudp_pacer_refill_and_can_send(&tx->pacer, *cur_us, wire_bytes);
+    }
+  }
+  (void)rudp_pacer_consume(&tx->pacer, wire_bytes);
 }
 
 static void enqueue_delayed_pkt(zc_video_tx_t *tx, const zc_video_hdr_t *hdr,
@@ -445,6 +518,25 @@ int zc_video_tx_send_frame(zc_video_tx_t *tx, uintptr_t udp_sock,
   if (!tx || !bitstream || len == 0 || !dst_addr) return -1;
   size_t frag_count = (len + ZC_FRAG_MTU - 1U) / ZC_FRAG_MTU;
   if (frag_count > ZC_MAX_FRAGS_PER_FRAME) return -1;
+  if (tx->history) {
+    zc_tx_history_t *e = &tx->history[frame_id % tx->history_frames];
+    e->valid = false;
+    if (len > e->cap) {
+      uint8_t *d = (uint8_t *)realloc(e->data, len + len / 4U);
+      if (d) {
+        e->data = d;
+        e->cap = len + len / 4U;
+      }
+    }
+    if (len <= e->cap) {
+      memcpy(e->data, bitstream, len);
+      e->len = len;
+      e->frame_id = frame_id;
+      e->keyframe = is_keyframe;
+      e->fec_shards = tx->fec_shards;
+      e->valid = true;
+    }
+  }
   uint16_t total_frags = (uint16_t)frag_count;
   uint16_t tail_len = (uint16_t)(len - (size_t)(total_frags - 1U) * ZC_FRAG_MTU);
   /* Parity shards cover the longest fragment (shorter ones are zero-padded). */
@@ -457,13 +549,7 @@ int zc_video_tx_send_frame(zc_video_tx_t *tx, uintptr_t udp_sock,
 
   SOCKET sock = (SOCKET)udp_sock;
   const struct sockaddr *dst = (const struct sockaddr *)dst_addr;
-
-  /* Single pacer reservation for the whole frame burst. Accounting only: the
-   * benchmarks send every frame immediately and never feed OWD samples back,
-   * so a refused reservation is ignored rather than delaying the frame. */
-  size_t est_wire = len + (size_t)total_frags * sizeof(zc_video_hdr_t);
-  (void)rudp_pacer_refill_and_can_send(&tx->pacer, now_us, (uint32_t)est_wire);
-  rudp_pacer_consume(&tx->pacer, (uint32_t)est_wire);
+  uint64_t cur_us = now_us;
 
   zc_video_hdr_t hdr;
   hdr.magic = ZC_VIDEO_MAGIC;
@@ -485,7 +571,8 @@ int zc_video_tx_send_frame(zc_video_tx_t *tx, uintptr_t udp_sock,
 
     hdr.frag_idx = i;
     hdr.payload_len = chunk;
-    emit_with_impair(tx, sock, dst, dst_addr_len, &hdr, src_slice, now_us,
+    tx_pace_packet(tx, (uint32_t)(sizeof(hdr) + hdr.payload_len), &cur_us);
+    emit_with_impair(tx, sock, dst, dst_addr_len, &hdr, src_slice, cur_us,
                      apply_impair);
   }
 
@@ -493,7 +580,8 @@ int zc_video_tx_send_frame(zc_video_tx_t *tx, uintptr_t udp_sock,
   hdr.payload_len = parity_len;
   for (uint8_t p = 0; p < tx->fec_shards; ++p) {
     hdr.frag_idx = (uint16_t)(total_frags + p);
-    emit_with_impair(tx, sock, dst, dst_addr_len, &hdr, parity_data[p], now_us,
+    tx_pace_packet(tx, (uint32_t)(sizeof(hdr) + hdr.payload_len), &cur_us);
+    emit_with_impair(tx, sock, dst, dst_addr_len, &hdr, parity_data[p], cur_us,
                      apply_impair);
   }
 
@@ -502,55 +590,215 @@ int zc_video_tx_send_frame(zc_video_tx_t *tx, uintptr_t udp_sock,
   return 0;
 }
 
+int zc_video_tx_enable_history(zc_video_tx_t *tx, uint32_t frames) {
+  if (!tx || frames == 0 || tx->history) return -1;
+  tx->history = (zc_tx_history_t *)calloc(frames, sizeof(zc_tx_history_t));
+  if (!tx->history) return -1;
+  tx->history_frames = frames;
+  return 0;
+}
+
+int zc_video_tx_resend(zc_video_tx_t *tx, uintptr_t udp_sock,
+                       const void *dst_addr, int dst_addr_len,
+                       uint32_t frame_id, const uint16_t *frags, uint16_t count,
+                       uint64_t now_us, bool apply_impair) {
+  if (!tx || !dst_addr || !tx->history) return 0;
+  const zc_tx_history_t *e = &tx->history[frame_id % tx->history_frames];
+  if (!e->valid || e->frame_id != frame_id) {
+    tx->resend_misses += (count > 0U) ? count : 1U;
+    return 0;
+  }
+  uint16_t total_frags = (uint16_t)((e->len + ZC_FRAG_MTU - 1U) / ZC_FRAG_MTU);
+  uint16_t tail_len = (uint16_t)(e->len - (size_t)(total_frags - 1U) * ZC_FRAG_MTU);
+
+  /* Same header as the first transmission: the receiver cannot tell them apart. */
+  zc_video_hdr_t hdr;
+  hdr.magic = ZC_VIDEO_MAGIC;
+  hdr.tail_len = tail_len;
+  hdr.frame_id = frame_id;
+  hdr.total_frags = total_frags;
+  hdr.parity_count = e->fec_shards;
+  hdr.flags = e->keyframe ? ZC_VIDEO_FLAG_KEYFRAME : 0U;
+
+  SOCKET sock = (SOCKET)udp_sock;
+  const struct sockaddr *dst = (const struct sockaddr *)dst_addr;
+  uint64_t cur_us = now_us;
+  uint32_t n = (count > 0U) ? count : total_frags;
+  int sent = 0;
+  for (uint32_t k = 0; k < n; ++k) {
+    uint16_t i = (count > 0U) ? frags[k] : (uint16_t)k;
+    if (i >= total_frags) continue;
+    hdr.frag_idx = i;
+    hdr.payload_len = expected_frag_len(i, total_frags, tail_len);
+    tx_pace_packet(tx, (uint32_t)(sizeof(hdr) + hdr.payload_len), &cur_us);
+    emit_with_impair(tx, sock, dst, dst_addr_len, &hdr,
+                     e->data + (size_t)i * ZC_FRAG_MTU, cur_us, apply_impair);
+    sent++;
+  }
+  tx->frags_resent += (uint64_t)sent;
+  tx_flush(tx);
+  return sent;
+}
+
+void zc_video_tx_on_ack(zc_video_tx_t *tx, uint32_t owd_us,
+                        uint32_t acked_bytes, uint8_t ce_marked) {
+  if (!tx) return;
+  (void)rudp_pacer_on_owd_sample(&tx->pacer, owd_us, acked_bytes, ce_marked);
+}
+
+void zc_rate_budget_init(zc_rate_budget_t *rb, const zc_video_tx_t *tx, uint32_t link_bps) {
+  if (!rb) return;
+  rb->link_bps = link_bps;
+  rb->ratio_q16 = 1U << 16;
+  rb->wire_mark = tx ? tx->bytes_sent : 0U;
+  rb->video_acc = 0;
+}
+
+uint32_t zc_rate_budget_update(zc_rate_budget_t *rb, const zc_video_tx_t *tx,
+                               size_t video_bytes) {
+  if (!rb || !tx) return 0;
+  rb->video_acc += video_bytes;
+  uint64_t wire = tx->bytes_sent - rb->wire_mark;
+  /* A sample once enough has gone out to mean something (about 16 KB):
+   * small frames alone are mostly header. */
+  if (wire >= 16384U && rb->video_acc > 0U) {
+    uint64_t r = (rb->video_acc << 16) / wire;
+    if (r > (1U << 16)) r = 1U << 16;
+    if (r < (1U << 14)) r = 1U << 14; /* never below a quarter */
+    rb->ratio_q16 = (uint32_t)(((uint64_t)rb->ratio_q16 * 7U + r) / 8U);
+    rb->wire_mark = tx->bytes_sent;
+    rb->video_acc = 0;
+  }
+  return (uint32_t)(((uint64_t)rb->link_bps * rb->ratio_q16) >> 16);
+}
+
 int zc_video_rx_init(zc_video_rx_t *rx, size_t max_frame_bytes) {
   if (!rx || max_frame_bytes == 0) return -1;
   memset(rx, 0, sizeof(*rx));
-  rx->active_frame_id = UINT32_MAX;
   rx->last_completed_frame_id = UINT32_MAX;
   rx->frame_cap = max_frame_bytes;
-  rx->frame_buf = (uint8_t *)VirtualAlloc(NULL, max_frame_bytes,
-                                          MEM_COMMIT | MEM_RESERVE,
-                                          PAGE_READWRITE);
-  rx->parity_buf = (uint8_t *)malloc(ZC_MAX_PARITY_SHARDS * ZC_FRAG_MTU);
-  if (!rx->frame_buf || !rx->parity_buf) {
+  for (uint32_t i = 0; i < ZC_RX_SLOTS; ++i) {
+    zc_video_rx_slot_t *s = &rx->slots[i];
+    /* Address space only: a slot commits what its largest frame needed, so
+     * the slots that only ever see small frames stay small. */
+    s->buf = (uint8_t *)VirtualAlloc(NULL, max_frame_bytes, MEM_RESERVE, PAGE_READWRITE);
+    s->parity_buf = (uint8_t *)malloc(ZC_MAX_PARITY_SHARDS * ZC_FRAG_MTU);
+    s->frag_lens = (uint16_t *)malloc(ZC_MAX_FRAGS_PER_FRAME * sizeof(uint16_t));
+    s->frag_present = (uint8_t *)malloc(ZC_MAX_FRAGS_PER_FRAME);
+    if (!s->buf || !s->parity_buf || !s->frag_lens || !s->frag_present) {
+      zc_video_rx_destroy(rx);
+      return -1;
+    }
+  }
+  /* Slot 0 is what callers read before any frame completed. */
+  if (!VirtualAlloc(rx->slots[0].buf, max_frame_bytes, MEM_COMMIT, PAGE_READWRITE)) {
     zc_video_rx_destroy(rx);
     return -1;
   }
-  (void)VirtualLock(rx->frame_buf, max_frame_bytes);
+  rx->slots[0].buf_committed = max_frame_bytes;
+  rx->frame_buf = rx->slots[0].buf;
   return 0;
 }
 
 void zc_video_rx_destroy(zc_video_rx_t *rx) {
   if (!rx) return;
-  if (rx->frame_buf) {
-    VirtualUnlock(rx->frame_buf, rx->frame_cap);
-    VirtualFree(rx->frame_buf, 0, MEM_RELEASE);
-    rx->frame_buf = NULL;
+  for (uint32_t i = 0; i < ZC_RX_SLOTS; ++i) {
+    zc_video_rx_slot_t *s = &rx->slots[i];
+    if (s->buf) VirtualFree(s->buf, 0, MEM_RELEASE);
+    free(s->parity_buf);
+    free(s->frag_lens);
+    free(s->frag_present);
+    memset(s, 0, sizeof(*s));
   }
-  free(rx->parity_buf);
-  rx->parity_buf = NULL;
+  rx->frame_buf = NULL;
 }
 
-static void rx_reset_frame(zc_video_rx_t *rx, const zc_video_hdr_t *hdr) {
-  if (rx->active_frame_id != UINT32_MAX &&
-      rx->received_data_frags < rx->total_frags) {
+/* Gives up on whatever the slot holds. */
+static void rx_release_slot(zc_video_rx_t *rx, zc_video_rx_slot_t *s) {
+  /* total_frags == 0: a frame known only by the gap it left. */
+  if (s->used && (s->total_frags == 0U || s->received_data_frags < s->total_frags)) {
     rx->frames_dropped++;
   }
-  rx->active_frame_id = hdr->frame_id;
-  rx->total_frags = hdr->total_frags;
-  rx->tail_len = hdr->tail_len;
-  rx->received_data_frags = 0;
-  rx->flags = hdr->flags & ZC_VIDEO_FLAG_KEYFRAME;
-  rx->parity_received_count = 0;
-  rx->highest_frag_seen = 0;
-  memset(rx->parity_present, 0, sizeof(rx->parity_present));
-  memset(rx->parity_lens, 0, sizeof(rx->parity_lens));
-  memset(rx->frag_present, 0, hdr->total_frags);
-  memset(rx->frag_lens, 0, hdr->total_frags * sizeof(uint16_t));
+  s->used = false;
+}
+
+static bool rx_start_frame(zc_video_rx_slot_t *s, const zc_video_hdr_t *hdr,
+                           size_t frame_cap) {
+  size_t need = (size_t)hdr->total_frags * ZC_FRAG_MTU;
+  if (need > frame_cap) need = frame_cap;
+  if (need > s->buf_committed) {
+    need = (need + 0xFFFFFU) & ~(size_t)0xFFFFFU; /* 1 MB steps */
+    if (need > frame_cap) need = frame_cap;
+    if (!VirtualAlloc(s->buf, need, MEM_COMMIT, PAGE_READWRITE)) return false;
+    s->buf_committed = need;
+  }
+  s->used = true;
+  s->complete = false;
+  s->fec_used = false;
+  s->frame_id = hdr->frame_id;
+  s->total_frags = hdr->total_frags;
+  s->tail_len = hdr->tail_len;
+  s->received_data_frags = 0;
+  s->flags = hdr->flags & ZC_VIDEO_FLAG_KEYFRAME;
+  s->parity_received_count = 0;
+  s->highest_frag_seen = 0;
+  memset(s->parity_present, 0, sizeof(s->parity_present));
+  memset(s->parity_lens, 0, sizeof(s->parity_lens));
+  memset(s->frag_present, 0, hdr->total_frags);
+  memset(s->frag_lens, 0, hdr->total_frags * sizeof(uint16_t));
+  return true;
+}
+
+static bool rx_recently_delivered(const zc_video_rx_t *rx, uint32_t frame_id) {
+  for (uint32_t i = 0; i < rx->recent_count; ++i) {
+    if (rx->recent_ids[i] == frame_id) return true;
+  }
+  return false;
+}
+
+/* The slot reassembling this frame, a new one for it, or NULL when the
+ * datagram belongs to a frame older than everything in reassembly. */
+static zc_video_rx_slot_t *rx_slot_for(zc_video_rx_t *rx, const zc_video_hdr_t *hdr) {
+  zc_video_rx_slot_t *free_slot = NULL, *oldest = NULL;
+  for (uint32_t i = 0; i < ZC_RX_SLOTS; ++i) {
+    zc_video_rx_slot_t *s = &rx->slots[i];
+    if (!s->used) {
+      /* Never overwrite the buffer the caller still holds in rx->frame_buf. */
+      if (s->buf != rx->frame_buf && !free_slot) free_slot = s;
+      continue;
+    }
+    if (s->frame_id == hdr->frame_id) {
+      if (s->total_frags == 0U) {
+        /* Known so far only as a gap: this is its first datagram. */
+        uint64_t first_us = s->first_us, last_nack_us = s->last_nack_us;
+        uint64_t last_rx_us = s->last_rx_us;
+        if (!rx_start_frame(s, hdr, rx->frame_cap)) return NULL;
+        s->first_us = first_us;
+        s->last_nack_us = last_nack_us;
+        s->last_rx_us = last_rx_us;
+      }
+      return s;
+    }
+    if (s->buf != rx->frame_buf &&
+        (!oldest || (int32_t)(s->frame_id - oldest->frame_id) < 0)) {
+      oldest = s;
+    }
+  }
+  if (!free_slot) {
+    if (!oldest || (int32_t)(hdr->frame_id - oldest->frame_id) <= 0) return NULL;
+    rx_release_slot(rx, oldest);
+    free_slot = oldest;
+  }
+  if (!rx_start_frame(free_slot, hdr, rx->frame_cap)) return NULL;
+  free_slot->first_us = rx->now_us;
+  free_slot->last_rx_us = 0;
+  free_slot->complete_us = 0;
+  free_slot->last_nack_us = 0;
+  return free_slot;
 }
 
 /* Solve m x m linear system over GF(2^8) to recover up to 4 erased fragments */
-static bool rx_recover_cauchy(zc_video_rx_t *rx) {
+static bool rx_recover_cauchy(zc_video_rx_slot_t *rx, size_t frame_cap) {
   uint16_t missing[ZC_MAX_PARITY_SHARDS];
   uint8_t m = 0;
   for (uint16_t i = 0; i < rx->total_frags; ++i) {
@@ -581,7 +829,7 @@ static bool rx_recover_cauchy(zc_video_rx_t *rx) {
     for (uint16_t i = 0; i < rx->total_frags; ++i) {
       if (rx->frag_present[i]) {
         uint8_t c = cauchy_coeff(p, i);
-        rudp_gf256_xor_scaled(rhs[r], rx->frame_buf + (size_t)i * ZC_FRAG_MTU,
+        rudp_gf256_xor_scaled(rhs[r], rx->buf + (size_t)i * ZC_FRAG_MTU,
                               rx->frag_lens[i], c);
       }
     }
@@ -627,12 +875,12 @@ static bool rx_recover_cauchy(zc_video_rx_t *rx) {
    * from the zero-padded parity length. */
   for (uint8_t r = 0; r < m; ++r) {
     uint16_t flen = expected_frag_len(missing[r], rx->total_frags, rx->tail_len);
-    if ((size_t)missing[r] * ZC_FRAG_MTU + flen > rx->frame_cap) return false;
+    if ((size_t)missing[r] * ZC_FRAG_MTU + flen > frame_cap) return false;
   }
   for (uint8_t r = 0; r < m; ++r) {
     uint16_t idx = missing[r];
     uint16_t flen = expected_frag_len(idx, rx->total_frags, rx->tail_len);
-    memcpy(rx->frame_buf + (size_t)idx * ZC_FRAG_MTU, rhs[r], flen);
+    memcpy(rx->buf + (size_t)idx * ZC_FRAG_MTU, rhs[r], flen);
     rx->frag_present[idx] = 1;
     rx->frag_lens[idx] = flen;
     rx->received_data_frags++;
@@ -652,6 +900,140 @@ static bool rx_parse_hdr(const uint8_t *pkt, size_t pkt_len, zc_video_hdr_t *hdr
          pkt_len >= sizeof(*hdr) + hdr->payload_len;
 }
 
+void zc_video_rx_set_ordered(zc_video_rx_t *rx, uint64_t hold_us,
+                             uint64_t nack_delay_us, uint64_t nack_interval_us) {
+  if (!rx) return;
+  rx->ordered = true;
+  rx->allow_out_of_order = false;
+  rx->hold_us = hold_us;
+  rx->nack_delay_us = nack_delay_us;
+  rx->nack_interval_us = nack_interval_us;
+}
+
+void zc_video_rx_tick(zc_video_rx_t *rx, uint64_t now_us) {
+  if (rx) rx->now_us = now_us;
+}
+
+static zc_video_rx_slot_t *rx_find_slot(zc_video_rx_t *rx, uint32_t frame_id) {
+  for (uint32_t i = 0; i < ZC_RX_SLOTS; ++i) {
+    if (rx->slots[i].used && rx->slots[i].frame_id == frame_id) return &rx->slots[i];
+  }
+  return NULL;
+}
+
+/* Ordered mode: a datagram of frame_id shows that the frames between the
+ * last one delivered and it exist. Those nothing was received of get a slot
+ * without geometry, so that they are waited for and asked for too. */
+static void rx_note_gap(zc_video_rx_t *rx, uint32_t frame_id) {
+  if (rx->last_completed_frame_id == UINT32_MAX) return;
+  int32_t ahead = (int32_t)(frame_id - rx->last_completed_frame_id);
+  if (ahead <= 1 || ahead > 8) return; /* further apart: not worth holding for */
+  for (uint32_t id = rx->last_completed_frame_id + 1U; id != frame_id; ++id) {
+    if (rx_find_slot(rx, id)) continue;
+    zc_video_rx_slot_t *fs = NULL;
+    for (uint32_t i = 0; i < ZC_RX_SLOTS && !fs; ++i) {
+      if (!rx->slots[i].used && rx->slots[i].buf != rx->frame_buf) fs = &rx->slots[i];
+    }
+    if (!fs) return;
+    fs->used = true;
+    fs->complete = false;
+    fs->fec_used = false;
+    fs->frame_id = id;
+    fs->total_frags = 0;
+    fs->received_data_frags = 0;
+    fs->first_us = rx->now_us;
+    fs->last_rx_us = 0;
+    fs->complete_us = 0;
+    fs->last_nack_us = 0;
+  }
+}
+
+int zc_video_rx_next(zc_video_rx_t *rx, size_t *out_len, uint32_t *out_frame_id,
+                     bool *out_keyframe, bool *out_fec_used) {
+  if (!rx || !rx->ordered) return 0;
+  for (;;) {
+    zc_video_rx_slot_t *o = NULL;
+    for (uint32_t i = 0; i < ZC_RX_SLOTS; ++i) {
+      zc_video_rx_slot_t *s = &rx->slots[i];
+      if (s->used && (!o || (int32_t)(s->frame_id - o->frame_id) < 0)) o = s;
+    }
+    if (!o) return 0;
+    if (!o->complete) {
+      /* The oldest frame is still short: everything waits for it, until
+       * it has been given its time. */
+      /* Counted from its last datagram: a large frame paced out at the
+       * link rate legitimately takes longer than hold_us to arrive. */
+      uint64_t since = (o->last_rx_us > o->first_us) ? o->last_rx_us : o->first_us;
+      if (rx->now_us - since < rx->hold_us) return 0;
+      rx_release_slot(rx, o);
+      if (rx->last_completed_frame_id == UINT32_MAX ||
+          (int32_t)(o->frame_id - rx->last_completed_frame_id) > 0) {
+        rx->last_completed_frame_id = o->frame_id;
+      }
+      continue;
+    }
+    rx->frames_completed++;
+    if (out_len) *out_len = (size_t)(o->total_frags - 1U) * ZC_FRAG_MTU + o->tail_len;
+    if (out_frame_id) *out_frame_id = o->frame_id;
+    if (out_keyframe) *out_keyframe = (o->flags & ZC_VIDEO_FLAG_KEYFRAME) != 0;
+    if (out_fec_used) *out_fec_used = o->fec_used;
+    rx->frame_buf = o->buf;
+    o->used = false;
+    rx->recent_ids[rx->recent_pos] = o->frame_id;
+    rx->recent_pos = (rx->recent_pos + 1U) % ZC_RX_RECENT;
+    if (rx->recent_count < ZC_RX_RECENT) rx->recent_count++;
+    rx->last_completed_frame_id = o->frame_id;
+    return 1;
+  }
+}
+
+size_t zc_video_rx_build_nack(zc_video_rx_t *rx, uint8_t *buf, size_t cap) {
+  if (!rx || !rx->ordered || !buf || cap < ZC_NACK_HDR_SZ + 2U * ZC_NACK_MAX_FRAGS) return 0;
+  for (uint32_t i = 0; i < ZC_RX_SLOTS; ++i) {
+    zc_video_rx_slot_t *s = &rx->slots[i];
+    if (!s->used || s->complete) continue;
+    if (rx->now_us - s->first_us < rx->nack_delay_us) continue;
+    if (s->last_nack_us != 0 && rx->now_us - s->last_nack_us < rx->nack_interval_us) continue;
+
+    /* The sender paces a frame out at the link rate, so fragments past the
+     * highest one seen may simply not have been sent yet. While the frame
+     * keeps arriving, only the fragments it skipped are missing (reordering
+     * aside); once it has been silent for nack_delay_us, everything still
+     * absent is: the tail was lost, or the whole frame. */
+    uint64_t last = (s->last_rx_us > s->first_us) ? s->last_rx_us : s->first_us;
+    bool stalled = (rx->now_us - last >= rx->nack_delay_us);
+    uint16_t upto = s->total_frags;
+    if (!stalled) {
+      if (s->total_frags == 0U || s->highest_frag_seen == 0U) continue;
+      upto = s->highest_frag_seen;
+      bool gap = false;
+      for (uint16_t f = 0; f < upto && !gap; ++f) gap = !s->frag_present[f];
+      if (!gap) continue;
+    }
+
+    uint16_t count = 0;
+    uint8_t *o = buf + ZC_NACK_HDR_SZ;
+    if (s->total_frags != 0U) {
+      for (uint16_t f = 0; f < upto; ++f) {
+        if (s->frag_present[f]) continue;
+        if (count == ZC_NACK_MAX_FRAGS) {
+          count = 0; /* too many to list: the whole frame */
+          break;
+        }
+        memcpy(o + (size_t)count * 2U, &f, 2);
+        count++;
+      }
+    }
+    memcpy(buf, ZC_NACK_MAGIC, 4);
+    memcpy(buf + 4, &s->frame_id, 4);
+    memcpy(buf + 8, &count, 2);
+    s->last_nack_us = rx->now_us ? rx->now_us : 1U;
+    rx->nacks_built++;
+    return ZC_NACK_HDR_SZ + (size_t)count * 2U;
+  }
+  return 0;
+}
+
 int zc_video_rx_feed(zc_video_rx_t *rx, const uint8_t *pkt, size_t pkt_len,
                      size_t *out_len, uint32_t *out_frame_id,
                      bool *out_keyframe, bool *out_fec_used) {
@@ -659,84 +1041,114 @@ int zc_video_rx_feed(zc_video_rx_t *rx, const uint8_t *pkt, size_t pkt_len,
   zc_video_hdr_t hdr;
   if (!rx_parse_hdr(pkt, pkt_len, &hdr)) return -1;
 
-  if (rx->last_completed_frame_id != UINT32_MAX &&
+  if (rx_recently_delivered(rx, hdr.frame_id)) {
+    rx->dup_packets_ignored++;
+    return 0;
+  }
+  if (!rx->allow_out_of_order && rx->last_completed_frame_id != UINT32_MAX &&
       (int32_t)(hdr.frame_id - rx->last_completed_frame_id) <= 0) {
     return 0;
   }
 
-  if (rx->active_frame_id == UINT32_MAX ||
-      (int32_t)(hdr.frame_id - rx->active_frame_id) > 0) {
-    rx_reset_frame(rx, &hdr);
-  } else if (hdr.frame_id != rx->active_frame_id) {
+  if (rx->ordered) rx_note_gap(rx, hdr.frame_id);
+  zc_video_rx_slot_t *s = rx_slot_for(rx, &hdr);
+  if (!s) return 0;
+  if (s->complete) {
+    rx->dup_packets_ignored++;
     return 0;
   }
 
   /* All datagrams of a frame must agree on its geometry. */
-  if (hdr.total_frags != rx->total_frags || hdr.tail_len != rx->tail_len) {
+  if (hdr.total_frags != s->total_frags || hdr.tail_len != s->tail_len) {
     return -1;
   }
 
-  if (hdr.frag_idx < rx->highest_frag_seen) {
+  s->last_rx_us = rx->now_us ? rx->now_us : 1U;
+  if (hdr.frag_idx < s->highest_frag_seen) {
     rx->ooo_packets_seen++;
   } else {
-    rx->highest_frag_seen = hdr.frag_idx;
+    s->highest_frag_seen = hdr.frag_idx;
   }
 
   const uint8_t *payload = pkt + sizeof(hdr);
 
   if (hdr.flags & ZC_VIDEO_FLAG_PARITY) {
-    uint16_t parity_len = (rx->total_frags > 1U) ? (uint16_t)ZC_FRAG_MTU : rx->tail_len;
+    uint16_t parity_len = (s->total_frags > 1U) ? (uint16_t)ZC_FRAG_MTU : s->tail_len;
     if (hdr.frag_idx < hdr.total_frags ||
         hdr.frag_idx - hdr.total_frags >= ZC_MAX_PARITY_SHARDS ||
         hdr.payload_len != parity_len) {
       return -1;
     }
     uint16_t p = (uint16_t)(hdr.frag_idx - hdr.total_frags);
-    if (rx->parity_present[p]) {
+    if (s->parity_present[p]) {
       rx->dup_packets_ignored++;
     } else {
-      memcpy(rx->parity_buf + (size_t)p * ZC_FRAG_MTU, payload, hdr.payload_len);
-      rx->parity_lens[p] = hdr.payload_len;
-      rx->parity_present[p] = 1;
-      rx->parity_received_count++;
+      memcpy(s->parity_buf + (size_t)p * ZC_FRAG_MTU, payload, hdr.payload_len);
+      s->parity_lens[p] = hdr.payload_len;
+      s->parity_present[p] = 1;
+      s->parity_received_count++;
     }
   } else {
-    if (hdr.frag_idx >= rx->total_frags ||
-        hdr.payload_len != expected_frag_len(hdr.frag_idx, rx->total_frags,
-                                             rx->tail_len)) {
+    if (hdr.frag_idx >= s->total_frags ||
+        hdr.payload_len != expected_frag_len(hdr.frag_idx, s->total_frags,
+                                             s->tail_len)) {
       return -1;
     }
-    if (rx->frag_present[hdr.frag_idx]) {
+    if (s->frag_present[hdr.frag_idx]) {
       rx->dup_packets_ignored++;
     } else {
       size_t dst_off = (size_t)hdr.frag_idx * ZC_FRAG_MTU;
       if (dst_off + hdr.payload_len > rx->frame_cap) return -2;
-      memcpy(rx->frame_buf + dst_off, payload, hdr.payload_len);
-      rx->frag_present[hdr.frag_idx] = 1;
-      rx->frag_lens[hdr.frag_idx] = hdr.payload_len;
-      rx->received_data_frags++;
+      memcpy(s->buf + dst_off, payload, hdr.payload_len);
+      s->frag_present[hdr.frag_idx] = 1;
+      s->frag_lens[hdr.frag_idx] = hdr.payload_len;
+      s->received_data_frags++;
     }
   }
 
   bool fec_used = false;
-  if (rx->received_data_frags < rx->total_frags) {
-    uint16_t missing_cnt = (uint16_t)(rx->total_frags - rx->received_data_frags);
-    if (missing_cnt > rx->parity_received_count || !rx_recover_cauchy(rx)) {
+  if (s->received_data_frags < s->total_frags) {
+    uint16_t missing_cnt = (uint16_t)(s->total_frags - s->received_data_frags);
+    if (missing_cnt > s->parity_received_count || !rx_recover_cauchy(s, rx->frame_cap)) {
       return 0;
     }
     rx->frames_fec_recovered++;
     fec_used = true;
   }
 
+  if (rx->ordered) {
+    s->complete = true;
+    s->fec_used = fec_used;
+    s->complete_us = rx->now_us;
+    return 0; /* handed out by zc_video_rx_next */
+  }
+
   rx->frames_completed++;
   if (out_len) {
-    *out_len = (size_t)(rx->total_frags - 1U) * ZC_FRAG_MTU + rx->tail_len;
+    *out_len = (size_t)(s->total_frags - 1U) * ZC_FRAG_MTU + s->tail_len;
   }
-  if (out_frame_id) *out_frame_id = rx->active_frame_id;
-  if (out_keyframe) *out_keyframe = (rx->flags & ZC_VIDEO_FLAG_KEYFRAME) != 0;
+  if (out_frame_id) *out_frame_id = s->frame_id;
+  if (out_keyframe) *out_keyframe = (s->flags & ZC_VIDEO_FLAG_KEYFRAME) != 0;
   if (out_fec_used) *out_fec_used = fec_used;
-  rx->last_completed_frame_id = rx->active_frame_id;
-  rx->active_frame_id = UINT32_MAX;
+
+  rx->frame_buf = s->buf;
+  s->used = false;
+  rx->recent_ids[rx->recent_pos] = s->frame_id;
+  rx->recent_pos = (rx->recent_pos + 1U) % ZC_RX_RECENT;
+  if (rx->recent_count < ZC_RX_RECENT) rx->recent_count++;
+  if (rx->last_completed_frame_id == UINT32_MAX ||
+      (int32_t)(s->frame_id - rx->last_completed_frame_id) > 0) {
+    rx->last_completed_frame_id = s->frame_id;
+  }
+  if (!rx->allow_out_of_order) {
+    /* Older frames can no longer be delivered in order. */
+    for (uint32_t i = 0; i < ZC_RX_SLOTS; ++i) {
+      zc_video_rx_slot_t *o = &rx->slots[i];
+      if (o->used && (int32_t)(o->frame_id - rx->last_completed_frame_id) < 0) {
+        rx_release_slot(rx, o);
+      }
+    }
+  }
   return 1;
 }
 
@@ -777,7 +1189,8 @@ int zc_video_rx_feed_slice(zc_video_rx_t *rx, const uint8_t *pkt, size_t pkt_len
     if (out_fec_used) *out_fec_used = false;
     return 1;
   }
-  *out_data = rx->frame_buf;
-  return zc_video_rx_feed(rx, pkt, pkt_len, out_len, out_frame_id,
-                          out_keyframe, out_fec_used);
+  int rc = zc_video_rx_feed(rx, pkt, pkt_len, out_len, out_frame_id,
+                            out_keyframe, out_fec_used);
+  *out_data = rx->frame_buf; /* the completed frame's buffer when rc == 1 */
+  return rc;
 }

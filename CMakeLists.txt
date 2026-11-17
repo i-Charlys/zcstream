@@ -30,6 +30,13 @@ set(ZCRUDP_SOURCES
 
 add_library(zcrudp_lib STATIC ${ZCRUDP_SOURCES})
 target_include_directories(zcrudp_lib PUBLIC "${ZCRUDP_DIR}/include")
+# No CMAKE_BUILD_TYPE is set by the documented configure line, which left the
+# transport (GF(2^8) FEC included) unoptimised while the executables were -O2.
+if(MSVC)
+  target_compile_options(zcrudp_lib PRIVATE /O2)
+else()
+  target_compile_options(zcrudp_lib PRIVATE -O2)
+endif()
 target_compile_definitions(zcrudp_lib PUBLIC
   RUDP_PAGE_SIZE=4096U
   RUDP_PAGE_POOL_PAGES=8192U
@@ -156,7 +163,53 @@ else()
   target_compile_options(zcrudp_ternary_bench PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter -mavx2)
 endif()
 
+# Ternary codec motion bench (GPU, no network; not part of ctest: needs a
+# D3D11 GPU). See the header of tests/ternary_motion_bench.c.
+add_executable(ternary_motion_bench tests/ternary_motion_bench.c)
+target_include_directories(ternary_motion_bench PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
+  "${TERN_VID_DIR}/include"
+)
+target_compile_definitions(ternary_motion_bench PRIVATE
+  TERN_VID_SHADERS_DIR="${TERN_VID_DIR}/shaders"
+)
+target_link_libraries(ternary_motion_bench PRIVATE
+  zcrudp_lib d3d11 dxgi dxguid d3dcompiler mfplat mfuuid mfreadwrite
+  ws2_32 winmm ole32 oleaut32 user32 gdi32
+)
+if(NOT MSVC)
+  target_compile_options(ternary_motion_bench PRIVATE -O2 -mavx2)
+endif()
+
 # Live 2-PC / Continuous Screen Streaming (Sender / Receiver)
+set(ZPSYNC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../zpsync")
+if(NOT EXISTS "${ZPSYNC_DIR}/include/zpsync.h")
+  message(FATAL_ERROR "zpsync not found at ${ZPSYNC_DIR}")
+endif()
+
+add_library(zpsync_lib STATIC
+  "${ZPSYNC_DIR}/src/zpsync_net.c"
+  "${ZPSYNC_DIR}/src/zpsync_crypto.c"
+  "${ZPSYNC_DIR}/src/zpsync_stun.c"
+  "${ZPSYNC_DIR}/src/zpsync_dht.c"
+  "${ZPSYNC_DIR}/src/zpsync_sentinel.c"
+  "${ZPSYNC_DIR}/src/zpsync_punch.c"
+  "${ZPSYNC_DIR}/src/zpsync_cruise.c"
+  "${ZPSYNC_DIR}/src/zpsync.c"
+)
+target_include_directories(zpsync_lib
+  PUBLIC "${ZPSYNC_DIR}/include"
+  PRIVATE "${ZPSYNC_DIR}/src"
+)
+target_link_libraries(zpsync_lib PUBLIC zcrudp_lib ws2_32 iphlpapi)
+target_compile_definitions(zpsync_lib PRIVATE _WIN32_WINNT=0x0601 WIN32_LEAN_AND_MEAN)
+if(MSVC)
+  target_compile_options(zpsync_lib PRIVATE /O2)
+else()
+  target_compile_options(zpsync_lib PRIVATE -O2)
+endif()
+
 add_executable(zcrudp_stream
   src/stream_live.c
   src/gpu_pipeline_win32.c
@@ -166,6 +219,7 @@ add_executable(zcrudp_stream
 target_include_directories(zcrudp_stream PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
   "${TERN_VID_DIR}/include"
+  "${ZPSYNC_DIR}/include"
 )
 
 target_compile_definitions(zcrudp_stream PRIVATE
@@ -174,6 +228,7 @@ target_compile_definitions(zcrudp_stream PRIVATE
 
 target_link_libraries(zcrudp_stream PRIVATE
   zcrudp_lib
+  zpsync_lib
   d3d11
   dxgi
   dxguid
