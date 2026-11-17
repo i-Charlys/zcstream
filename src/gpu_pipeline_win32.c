@@ -997,6 +997,17 @@ static size_t tern_pack_bound(uint32_t num_records) {
 
 /* Sorts records by (class, position). Returns the sorted keys, each
  * (class << 60 | position << 32 | source index), or NULL without memory. */
+/* Host buffers are sized at creation (tern_prealloc_host); growing one
+ * later means an allocation, and page faults, in the frame loop. Kept as a
+ * safety net, and said once so that a too small bound gets noticed. */
+static void tern_note_late_alloc(const char *what, size_t bytes) {
+  static volatile LONG said = 0;
+  if (InterlockedExchange(&said, 1) == 0) {
+    fprintf(stderr, "ternary: %s grew to %zu bytes after start-up (pre-allocation too small)\n",
+            what, bytes);
+  }
+}
+
 /* A record word pair the encoder left unused (refused transform block). */
 #define TERN_NO_RECORD 0xFFFFFFFFU
 
@@ -1005,6 +1016,7 @@ static const uint64_t *tern_sort_records(gpu_pipeline_t *p, const uint32_t *rec,
   uint32_t num_records = *num_io;
   if (num_records > p->tern_sort_cap) {
     uint32_t cap = num_records + num_records / 2U + 1024U;
+    if (p->tern_sort_cap != 0U) tern_note_late_alloc("record sort", (size_t)cap * 16U);
     uint64_t *a = (uint64_t *)realloc(p->tern_sort_a, (size_t)cap * sizeof(uint64_t));
     if (a) p->tern_sort_a = a;
     uint64_t *b = (uint64_t *)realloc(p->tern_sort_b, (size_t)cap * sizeof(uint64_t));
@@ -1820,6 +1832,7 @@ static size_t tern_ec_pack_records(gpu_pipeline_t *p, const uint32_t *rec,
     need += job.cap[c];
   }
   if (need > p->tern_ec_scratch_cap) {
+    if (p->tern_ec_scratch_cap != 0U) tern_note_late_alloc("range coder scratch", need + need / 2U);
     uint8_t *s = (uint8_t *)realloc(p->tern_ec_scratch, need + need / 2U);
     if (!s) return 0;
     p->tern_ec_scratch = s;
@@ -2508,6 +2521,57 @@ static int setup_ternary_hlsl(gpu_pipeline_t *p, gpu_pipeline_info_t *info) {
   return 0;
 }
 
+/* Every host buffer the frame loop uses, at its working size and with its
+ * pages touched, so that nothing is allocated or faulted in after frame 0
+ * (a lazy realloc or first touch costs an OS call in the middle of a frame:
+ * a p99 spike at 480 Hz). The bound is what a frame can realistically carry
+ * (4 start bursts, at least 1M record words), not the absolute maximum
+ * (tens of MB at 4K); beyond it the old growth paths still work and say so. */
+static int tern_prealloc_host(gpu_pipeline_t *p) {
+  uint32_t num_px = p->width * p->height;
+  uint32_t burst_words = num_px / 14U;
+  if (burst_words < 140000U) burst_words = 140000U;
+  uint32_t words = burst_words * 4U;
+  if (words < (1U << 20)) words = 1U << 20;
+  if (words > p->tern_max_record_words) words = p->tern_max_record_words;
+  uint32_t records = words / 2U + 1024U;
+
+  p->tern_sort_a = (uint64_t *)malloc((size_t)records * sizeof(uint64_t));
+  p->tern_sort_b = (uint64_t *)malloc((size_t)records * sizeof(uint64_t));
+  if (!p->tern_sort_a || !p->tern_sort_b) return -1;
+  memset(p->tern_sort_a, 0, (size_t)records * sizeof(uint64_t));
+  memset(p->tern_sort_b, 0, (size_t)records * sizeof(uint64_t));
+  p->tern_sort_cap = records;
+
+  for (uint32_t c = 0; c < TERN_EC_MAX_CHUNKS; ++c) {
+    if (!tern_ec_alloc(p, c)) return -1;
+    memset(p->tern_ec_line[c], 0, (size_t)p->width * 3U);
+    memset(p->tern_ec_lrow[c], 0, (size_t)p->width * sizeof(uint32_t));
+    memset(p->tern_ec_model[c], 0, sizeof(zcrudp_tec_model_t));
+  }
+  size_t ec = tern_ec_chunk_bound(records) + TERN_EC_MAX_CHUNKS * tern_ec_chunk_bound(0U);
+  ec += ec / 2U;
+  p->tern_ec_scratch = (uint8_t *)malloc(ec);
+  if (!p->tern_ec_scratch) return -1;
+  memset(p->tern_ec_scratch, 0, ec);
+  p->tern_ec_scratch_cap = ec;
+
+  /* move + dirty rectangles: 64 KB is some 2700 of them */
+  p->dupl_meta_cap = 64U * 1024U;
+  p->dupl_meta = (uint8_t *)calloc(p->dupl_meta_cap, 1U);
+  if (!p->dupl_meta) return -1;
+
+  uint32_t num_tiles = p->tern_tiles_x * p->tern_tiles_y;
+  p->tern_dec_mv_scratch = (int32_t *)calloc((size_t)num_tiles * 2U, sizeof(int32_t));
+  if (!p->tern_dec_mv_scratch) return -1;
+  p->tern_dec_mv_cap = num_tiles;
+  p->tern_dec_unpack_buf = (uint32_t *)malloc((size_t)words * sizeof(uint32_t));
+  if (!p->tern_dec_unpack_buf) return -1;
+  memset(p->tern_dec_unpack_buf, 0, (size_t)words * sizeof(uint32_t));
+  p->tern_dec_unpack_cap = words;
+  return 0;
+}
+
 int gpu_pipeline_create_ternary(gpu_pipeline_t **out_pipe, uint32_t width,
                                 uint32_t height, uint32_t fps,
                                 uint32_t threshold, uint32_t delta_step,
@@ -2560,6 +2624,10 @@ int gpu_pipeline_create_ternary(gpu_pipeline_t **out_pipe, uint32_t width,
   if (rc != 0) {
     gpu_pipeline_destroy(p);
     return rc;
+  }
+  if (tern_prealloc_host(p) != 0) {
+    gpu_pipeline_destroy(p);
+    return -31;
   }
   *out_pipe = p;
   if (out_info) *out_info = info;
@@ -2872,6 +2940,7 @@ static bool build_capture_hints(gpu_pipeline_t *p, const DXGI_OUTDUPL_FRAME_INFO
                                 uint32_t desk_w, uint32_t desk_h) {
   if (!p->use_ternary || !p->tern_hint_cpu || fi->TotalMetadataBufferSize == 0U) return false;
   if (fi->TotalMetadataBufferSize > p->dupl_meta_cap) {
+    if (p->dupl_meta_cap != 0U) tern_note_late_alloc("capture metadata", fi->TotalMetadataBufferSize);
     uint8_t *m = (uint8_t *)realloc(p->dupl_meta, fi->TotalMetadataBufferSize);
     if (!m) return false;
     p->dupl_meta = m;
@@ -3665,6 +3734,7 @@ int gpu_pipeline_decode_and_present(gpu_pipeline_t *p,
 
     uint32_t num_tiles = p->tern_tiles_x * p->tern_tiles_y;
     if (num_tiles > p->tern_dec_mv_cap) {
+      if (p->tern_dec_mv_cap != 0U) tern_note_late_alloc("decoder vectors", (size_t)num_tiles * 8U);
       int32_t *nb = (int32_t *)realloc(p->tern_dec_mv_scratch,
                                        (size_t)num_tiles * 2U * sizeof(int32_t));
       if (!nb) return -1;
@@ -3712,6 +3782,7 @@ int gpu_pipeline_decode_and_present(gpu_pipeline_t *p,
       uint32_t got_words = record_words;
       if (packed_records) {
         if ((size_t)record_words > p->tern_dec_unpack_cap) {
+          if (p->tern_dec_unpack_cap != 0U) tern_note_late_alloc("decoder records", (size_t)record_words * 4U);
           uint32_t *nb = (uint32_t *)realloc(p->tern_dec_unpack_buf,
                                              (size_t)record_words * sizeof(uint32_t));
           if (!nb) return -1;

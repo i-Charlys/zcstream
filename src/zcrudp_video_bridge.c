@@ -590,11 +590,24 @@ int zc_video_tx_send_frame(zc_video_tx_t *tx, uintptr_t udp_sock,
   return 0;
 }
 
+/* Each entry holds a frame of this size from the start, pages touched, so
+ * that keeping a frame for retransmission allocates nothing in the send
+ * path (frames are tens of KB at 25-50 Mbps; a larger one still grows its
+ * entry). */
+#define ZC_HISTORY_ENTRY_BYTES (512U * 1024U)
+
 int zc_video_tx_enable_history(zc_video_tx_t *tx, uint32_t frames) {
   if (!tx || frames == 0 || tx->history) return -1;
   tx->history = (zc_tx_history_t *)calloc(frames, sizeof(zc_tx_history_t));
   if (!tx->history) return -1;
   tx->history_frames = frames;
+  for (uint32_t i = 0; i < frames; ++i) {
+    zc_tx_history_t *e = &tx->history[i];
+    e->data = (uint8_t *)malloc(ZC_HISTORY_ENTRY_BYTES);
+    if (!e->data) break; /* the send path grows it when needed */
+    memset(e->data, 0, ZC_HISTORY_ENTRY_BYTES);
+    e->cap = ZC_HISTORY_ENTRY_BYTES;
+  }
   return 0;
 }
 
@@ -672,6 +685,8 @@ uint32_t zc_rate_budget_update(zc_rate_budget_t *rb, const zc_video_tx_t *tx,
   return (uint32_t)(((uint64_t)rb->link_bps * rb->ratio_q16) >> 16);
 }
 
+#define ZC_RX_SLOT_COMMIT ((size_t)1024U * 1024U)
+
 int zc_video_rx_init(zc_video_rx_t *rx, size_t max_frame_bytes) {
   if (!rx || max_frame_bytes == 0) return -1;
   memset(rx, 0, sizeof(*rx));
@@ -696,6 +711,23 @@ int zc_video_rx_init(zc_video_rx_t *rx, size_t max_frame_bytes) {
     return -1;
   }
   rx->slots[0].buf_committed = max_frame_bytes;
+  /* The other slots get ZC_RX_SLOT_COMMIT committed and touched now, so
+   * that receiving an ordinary frame never commits or faults pages in the
+   * receive path; only a frame larger than that still commits more. */
+  for (uint32_t i = 1; i < ZC_RX_SLOTS; ++i) {
+    zc_video_rx_slot_t *s = &rx->slots[i];
+    size_t c = (ZC_RX_SLOT_COMMIT < max_frame_bytes) ? ZC_RX_SLOT_COMMIT : max_frame_bytes;
+    if (VirtualAlloc(s->buf, c, MEM_COMMIT, PAGE_READWRITE)) {
+      memset(s->buf, 0, c);
+      s->buf_committed = c;
+    }
+  }
+  for (uint32_t i = 0; i < ZC_RX_SLOTS; ++i) {
+    memset(rx->slots[i].parity_buf, 0, ZC_MAX_PARITY_SHARDS * ZC_FRAG_MTU);
+    memset(rx->slots[i].frag_lens, 0, ZC_MAX_FRAGS_PER_FRAME * sizeof(uint16_t));
+    memset(rx->slots[i].frag_present, 0, ZC_MAX_FRAGS_PER_FRAME);
+  }
+  memset(rx->slots[0].buf, 0, (ZC_RX_SLOT_COMMIT < max_frame_bytes) ? ZC_RX_SLOT_COMMIT : max_frame_bytes);
   rx->frame_buf = rx->slots[0].buf;
   return 0;
 }
