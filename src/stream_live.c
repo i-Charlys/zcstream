@@ -536,6 +536,13 @@ static int run_sender(stream_codec_t codec, const char *host, uint16_t port,
              (unsigned long long)ctl.nacks_received,
              (unsigned long long)tx->frags_resent,
              (unsigned long long)ctl.resyncs);
+      if (codec == CODEC_TERNARY) {
+        uint64_t hf = 0, hm = 0, hmt = 0, hst = 0;
+        gpu_pipeline_ternary_hint_stats(gpu, &hf, &hm, &hmt, &hst);
+        printf("[SENDER] capture hints: %llu frames, %llu move rects, %llu moved tiles, %llu unchanged tiles\n",
+               (unsigned long long)hf, (unsigned long long)hm, (unsigned long long)hmt,
+               (unsigned long long)hst);
+      }
       fflush(stdout);
       last_report_us = now_us;
       frames_period = 0;

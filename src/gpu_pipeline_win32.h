@@ -111,6 +111,12 @@ void gpu_pipeline_ternary_set_qpel(gpu_pipeline_t *pipe, bool enable);
  */
 void gpu_pipeline_ternary_set_dither(gpu_pipeline_t *pipe, bool enable);
 
+/** Capture hint counters since creation: desktop frames that carried move /
+ *  dirty rectangles, move rectangles, tiles hinted as moved, tiles hinted as
+ *  unchanged. */
+void gpu_pipeline_ternary_hint_stats(gpu_pipeline_t *pipe, uint64_t *frames, uint64_t *move_rects,
+                                     uint64_t *moved_tiles, uint64_t *static_tiles);
+
 /**
  * Record words per frame this pipeline can range-decode within its share of
  * the frame period, from what decoding has cost it so far. A receiver sends

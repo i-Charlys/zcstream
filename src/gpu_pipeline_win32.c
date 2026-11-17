@@ -322,6 +322,7 @@ struct gpu_pipeline_s {
   UINT dupl_meta_cap;
   bool tern_hints_static;             /* no new desktop frame: every tile unchanged */
   bool tern_hints_set;                /* tern_hint_cpu holds this frame's hints */
+  uint64_t hint_frames, hint_moved_tiles, hint_static_tiles, hint_move_rects; /* counters */
   ID3D11ShaderResourceView *tern_enc_mvs_srv[2];
   ID3D11UnorderedAccessView *tern_enc_mvs_uav[2];
   uint32_t tern_mv_ping;
@@ -1611,14 +1612,9 @@ static size_t tern_ec_put_chunk(gpu_pipeline_t *p, uint32_t slot, const uint32_t
      * (4-px intra). span is a record's extent in those units, px in pixels. */
     const uint32_t unit = (cls == 7U) ? 2U : 1U;
     const uint32_t px = (cls < 6U) ? 0U : (cls == 6U) ? 2U : 4U;
-    const uint32_t span = (cls < 6U || cls == 8U) ? 1U : px / unit;
-    const uint32_t id_limit = (cls == 8U) ? tern_ec_tq_limit(p) : tern_ec_id_limit(num_px, cls);
+    const uint32_t span = (cls < 6U) ? 1U : px / unit;
+    const uint32_t id_limit = tern_ec_id_limit(num_px, cls);
     uint32_t next = 0; /* first position the next record may take */
-    zcrudp_rc_prob_t qp_same, pred_prob;
-    zcrudp_rc_prob_init(&qp_same, 30000U);
-    zcrudp_rc_prob_init(&pred_prob, 16384U);
-    uint32_t last_qp[2] = {64U, 64U};
-    uint32_t cur_block = UINT32_MAX, cur_pred = 0U;
     for (uint32_t n = 0; n < counts[cls]; ++n, ++i) {
       uint32_t src = (uint32_t)keys[i];
       uint32_t id = (uint32_t)(keys[i] >> 32) & 0x0FFFFFFFU;
@@ -1626,29 +1622,7 @@ static size_t tern_ec_put_chunk(gpu_pipeline_t *p, uint32_t slot, const uint32_t
       /* Duplicated, overlapping or out-of-frame record: not representable. */
       if (id < next || id >= id_limit) return 0;
       zcrudp_tec_enc_run(&rc, tm, id - next);
-      if (cls == 8U) {
-        uint32_t qp = (w1 >> 16) & 0xFFU;
-        uint32_t pred = (w1 >> 24) & 0xFFU;
-        int32_t level = (int32_t)(int16_t)(w1 & 0xFFFFU);
-        if (qp > 51U || pred > 1U || level < -255 || level > 255) return 0;
-        /* pred is per block: coded on the first record of each block this
-         * chunk holds (a chunk may start in the middle of a block). */
-        if (id / 48U != cur_block) {
-          zcrudp_rc_enc_bit(&rc, &pred_prob, pred);
-          cur_block = id / 48U;
-          cur_pred = pred;
-        } else if (pred != cur_pred) {
-          return 0;
-        }
-        uint32_t chroma = ((id % 48U) >= 16U) ? 1U : 0U;
-        zcrudp_rc_enc_bit(&rc, &qp_same, (qp != last_qp[chroma]) ? 1U : 0U);
-        if (qp != last_qp[chroma]) zcrudp_rc_enc_direct(&rc, qp, 6U);
-        last_qp[chroma] = qp;
-        uint32_t k = id % 16U;
-        uint32_t bucket = (k == 0U) ? 5U : (k < 3U) ? 4U : (k < 6U) ? 3U : (k < 10U) ? 2U : 1U;
-        zcrudp_iec_enc_residual(&rc, chroma ? &im.chroma : &im.luma, bucket,
-                                (k == 0U) ? 1U : 0U, level);
-      } else if (cls < 6U) {
+      if (cls < 6U) {
         if (w1 >= 59049U) return 0;
         zcrudp_tec_hist_clear(tm, (size_t)next * 10U, (size_t)id * 10U);
         tern_ec_put_trits(&rc, tm, (size_t)id * 10U, w1);
@@ -1720,37 +1694,15 @@ static uint32_t tern_ec_get_chunk(gpu_pipeline_t *p, uint32_t slot, const uint8_
      * (4-px intra). span is a record's extent in those units, px in pixels. */
     const uint32_t unit = (cls == 7U) ? 2U : 1U;
     const uint32_t px = (cls < 6U) ? 0U : (cls == 6U) ? 2U : 4U;
-    const uint32_t span = (cls < 6U || cls == 8U) ? 1U : px / unit;
-    const uint32_t id_limit = (cls == 8U) ? tern_ec_tq_limit(p) : tern_ec_id_limit(num_px, cls);
+    const uint32_t span = (cls < 6U) ? 1U : px / unit;
+    const uint32_t id_limit = tern_ec_id_limit(num_px, cls);
     uint32_t next = 0;
-    zcrudp_rc_prob_t qp_same, pred_prob;
-    zcrudp_rc_prob_init(&qp_same, 30000U);
-    zcrudp_rc_prob_init(&pred_prob, 16384U);
-    uint32_t last_qp[2] = {64U, 64U};
-    uint32_t cur_block = UINT32_MAX, cur_pred = 0U;
     for (uint32_t n = 0; n < count; ++n) {
       uint64_t run = zcrudp_tec_dec_run(&rc, tm);
       if (run >= id_limit || next + (uint32_t)run >= id_limit) return UINT32_MAX;
       uint32_t id = next + (uint32_t)run;
       uint32_t w0, w1;
-      if (cls == 8U) {
-        uint32_t chroma = ((id % 48U) >= 16U) ? 1U : 0U;
-        if (id / 48U != cur_block) {
-          cur_pred = zcrudp_rc_dec_bit(&rc, &pred_prob);
-          cur_block = id / 48U;
-        }
-        if (zcrudp_rc_dec_bit(&rc, &qp_same) != 0U) {
-          last_qp[chroma] = (uint32_t)zcrudp_rc_dec_direct(&rc, 6U);
-        }
-        uint32_t qp = last_qp[chroma];
-        if (qp > 51U) return UINT32_MAX;
-        uint32_t k = id % 16U;
-        uint32_t bucket = (k == 0U) ? 5U : (k < 3U) ? 4U : (k < 6U) ? 3U : (k < 10U) ? 2U : 1U;
-        int32_t level = zcrudp_iec_dec_residual(&rc, chroma ? &im.chroma : &im.luma, bucket,
-                                                (k == 0U) ? 1U : 0U);
-        w0 = 0xF0000000U | id;
-        w1 = ((uint32_t)level & 0xFFFFU) | (qp << 16) | (cur_pred << 24);
-      } else if (cls < 6U) {
+      if (cls < 6U) {
         zcrudp_tec_hist_clear(tm, (size_t)next * 10U, (size_t)id * 10U);
         w1 = tern_ec_get_trits(&rc, tm, (size_t)id * 10U);
         w0 = ((cls >> 1) << 30) | ((cls & 1U) << 29) | id;
@@ -2597,6 +2549,15 @@ void gpu_pipeline_ternary_set_transform(gpu_pipeline_t *p, bool enable) {
   if (p && p->use_ternary) p->tern_tq = enable;
 }
 
+void gpu_pipeline_ternary_hint_stats(gpu_pipeline_t *p, uint64_t *frames, uint64_t *move_rects,
+                                     uint64_t *moved_tiles, uint64_t *static_tiles) {
+  if (!p) return;
+  if (frames) *frames = p->hint_frames;
+  if (move_rects) *move_rects = p->hint_move_rects;
+  if (moved_tiles) *moved_tiles = p->hint_moved_tiles;
+  if (static_tiles) *static_tiles = p->hint_static_tiles;
+}
+
 void gpu_pipeline_ternary_set_dither(gpu_pipeline_t *p, bool enable) {
   if (p && p->use_ternary) p->tern_dither = enable;
 }
@@ -2932,6 +2893,12 @@ static bool build_capture_hints(gpu_pipeline_t *p, const DXGI_OUTDUPL_FRAME_INFO
     }
   }
 #undef TERN_RECT_TILES
+  p->hint_frames++;
+  p->hint_move_rects += moves;
+  for (uint32_t t = 0; t < tx_n * ty_n; ++t) {
+    if (h[t * 4U] == 1) p->hint_moved_tiles++;
+    else if (h[t * 4U] == 2) p->hint_static_tiles++;
+  }
   return true;
 }
 
