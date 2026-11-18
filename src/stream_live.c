@@ -722,6 +722,7 @@ static int run_receiver(stream_codec_t codec, uint16_t port, uint32_t width,
   uint64_t last_caps_us = 0;
   uint64_t prev_drops = 0;
   bool need_sync = false;
+  uint32_t last_rx_fid = 0; /* id of the last frame handed to the decoder */
   struct sockaddr_in sender_addr;
   memset(&sender_addr, 0, sizeof(sender_addr));
   bool have_sender_addr = zp_active;
@@ -776,7 +777,15 @@ static int run_receiver(stream_codec_t codec, uint16_t port, uint32_t width,
                 rx_fid, rx_len, rx_kf ? 1 : 0, rx_fec ? 1 : 0);
       } else if (rx_kf) {
         need_sync = false;
+      } else if (rx_fid != last_rx_fid + 1U) {
+        /* A frame was skipped without being given up: lost whole before
+         * the first delivery, or in a burst wider than the gap window of
+         * zc_video_rx (8 frames). frames_dropped does not count it, yet
+         * this frame is a delta on a picture the decoder does not have.
+         * (Found by the TLA+ model, proofs/ZcTransport.tla.) */
+        need_sync = true;
       }
+      last_rx_fid = rx_fid;
       ack_bytes_pending += (uint32_t)rx_len;
       last_ack_fid = rx_fid;
       double dec_us = 0.0, prs_us = 0.0;
