@@ -248,7 +248,27 @@ it used to address pixels and wrapped past 4.19 Mpx (11.0 dB at 4K).
   `--bitrate`.
 - **Capture hints.** With desktop duplication, the move and dirty rectangles
   DXGI reports become per-tile hints: tiles nothing touched skip the motion
-  search, tiles inside a moved rectangle get its vector as a candidate.
+  search, tiles inside a moved rectangle get its vector as a candidate. On
+  Windows 11 (build 26300) DXGI reports no move rectangles at all, even for a
+  window dragged with the mouse, only dirty ones: the unchanged-tile hint
+  works, the moved-tile one is never exercised (the motion search finds such
+  vectors anyway).
+- **Pacing.** The pacer runs at twice `--bitrate` (up to 4x when the delay
+  feedback allows): at exactly the bitrate, any frame larger than average
+  queued the frames behind it. The delay fed back to it is measured from the
+  last datagram of a frame (not from before the pacer) and never from a frame
+  that needed a retransmission: counting either made the pacer cut its own
+  rate on every large frame, down to its minimum. Bench at 25 Mbps,
+  120 fps: TX p50 / p99 from 5.3 / 15 ms to 0.17 / 0.24 ms, end to end
+  0.83 / 1.37 ms; with 5 % loss and 2 ms ± 0.5 ms delay, end to end
+  3.0 / 7.0 ms (was 6.3 / 12.3 ms).
+- **End of session.** The sender keeps answering retransmission requests for
+  200 ms after its last frame, and sends that frame's last fragment again
+  (a tail probe): a last frame that lost every datagram leaves no gap for the
+  receiver to notice.
+- **No allocation after start-up.** Host buffers (record sort, range coder,
+  decoder, capture metadata, TX history, RX slots) are sized and touched at
+  creation; growing one later still works and is reported once on stderr.
 - **Display deblocking.** `CSYCbCrToRGBA` smooths luma steps of at most 6
   across 4x4 block edges, after the closed loop (no drift possible). Effect
   on PSNR: 0 to +0.08 dB.

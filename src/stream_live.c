@@ -305,6 +305,9 @@ static void sender_poll_ctrl(sender_ctrl_t *c) {
         memcpy(frags, cbuf + ZC_NACK_HDR_SZ, (size_t)count * 2U);
         c->nacks_received++;
         sender_note_loss(c);
+        /* No delay sample from a frame that needed a retransmission (Karn):
+         * its ack comes after the recovery, which is not queueing delay. */
+        c->frame_send_us[frame_id & 63U] = 0ULL;
         zc_video_tx_resend(c->tx, (uintptr_t)c->tx_sock,
                            c->use_connected_sock ? NULL : (const struct sockaddr *)&c->dst_addr,
                            c->use_connected_sock ? 0 : (int)sizeof(c->dst_addr),
@@ -394,8 +397,9 @@ static int run_sender(stream_codec_t codec, const char *host, uint16_t port,
   zc_net_impair_t impair = *sim;
   const bool apply_impair = (impair.loss_pct > 0 || impair.burst_prob_pct > 0);
   if (!tx ||
-      zc_video_tx_init(tx, RUDP_PAGE_POOL_PAGES, bitrate_bps, bitrate_bps / 4U,
-                       bitrate_bps * 2U, fec_shards, &impair,
+      zc_video_tx_init(tx, RUDP_PAGE_POOL_PAGES, zc_pace_bps(bitrate_bps, ZC_PACE_HEADROOM),
+                       bitrate_bps / 4U, zc_pace_bps(bitrate_bps, 2U * ZC_PACE_HEADROOM),
+                       fec_shards, &impair,
                        qpc_now_us()) != 0) {
     fprintf(stderr, "zc_video_tx_init failed\n");
     free(tx);
@@ -470,6 +474,7 @@ static int run_sender(stream_codec_t codec, const char *host, uint16_t port,
   uint64_t next_tick_us = qpc_now_us();
   uint64_t last_report_us = next_tick_us;
   uint64_t frames_sent = 0;
+  size_t last_frame_len = 0; /* for the tail probe */
   uint64_t bytes_period = 0;
   uint64_t frames_period = 0;
   zc_rate_budget_t rate_budget;
@@ -505,7 +510,6 @@ static int run_sender(stream_codec_t codec, const char *host, uint16_t port,
       uint64_t now_us = qpc_now_us();
       bool tx_kf = keyframe || (ctl.resync_kf_frames > 0U);
       if (ctl.resync_kf_frames > 0U) ctl.resync_kf_frames--;
-      ctl.frame_send_us[frames_sent & 63U] = now_us;
       /* Transport ids count the frames actually sent: the receiver takes a
        * hole in them for a lost frame and waits for it. */
       zc_video_tx_send_frame(tx, (uintptr_t)tx_sock,
@@ -513,6 +517,13 @@ static int run_sender(stream_codec_t codec, const char *host, uint16_t port,
                              zp_active ? 0 : (int)sizeof(dst_addr),
                              (uint32_t)frames_sent, bs, bs_len,
                              tx_kf, now_us, apply_impair);
+      /* Stamped once the last datagram is out: the delay the pacer reacts
+       * to must be the network's, not the time this frame waited in the
+       * pacer itself. Counting that made a large frame look like
+       * congestion, the rate was cut, frames waited longer still, and the
+       * pacer throttled itself down to its minimum. */
+      ctl.frame_send_us[frames_sent & 63U] = qpc_now_us();
+      last_frame_len = bs_len;
       frames_sent++;
       frames_period++;
       bytes_period += bs_len;
@@ -566,6 +577,32 @@ static int run_sender(stream_codec_t codec, const char *host, uint16_t port,
       }
     } else if (now_us - next_tick_us > frame_period_us * 4ULL) {
       next_tick_us = now_us;
+    }
+  }
+  /* The last frames may still be missing datagrams: keep answering their
+   * retransmission requests for a moment (the receiver asks after 3 ms,
+   * then every 10 ms) instead of leaving it waiting for frames nobody sends. */
+  /* A frame that lost all its datagrams is only noticed by the gap before
+   * the next one, and the last frame has no next one: its last fragment
+   * goes out again (a tail probe, 3 times since it can be lost too), the
+   * receiver then sees the frame and asks for the rest. */
+  {
+    uint64_t t0 = qpc_now_us();
+    uint64_t linger_end = t0 + 200000ULL;
+    uint32_t probes = 0;
+    while (InterlockedCompareExchange(&g_running, 1, 1) == 1 && qpc_now_us() < linger_end) {
+      if (frames_sent > 0U && last_frame_len > 0U && probes < 3U &&
+          qpc_now_us() >= t0 + 20000ULL * (probes + 1U)) {
+        uint16_t last_frag = (uint16_t)((last_frame_len + ZC_FRAG_MTU - 1U) / ZC_FRAG_MTU - 1U);
+        zc_video_tx_resend(tx, (uintptr_t)tx_sock,
+                           zp_active ? NULL : (const struct sockaddr *)&dst_addr,
+                           zp_active ? 0 : (int)sizeof(dst_addr),
+                           (uint32_t)(frames_sent - 1U), &last_frag, 1U,
+                           qpc_now_us(), apply_impair);
+        probes++;
+      }
+      sender_poll_ctrl(&ctl);
+      Sleep(1);
     }
   }
 

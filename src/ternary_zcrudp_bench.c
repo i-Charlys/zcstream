@@ -148,8 +148,8 @@ int main(int argc, char **argv) {
   zc_video_tx_t *tx = (zc_video_tx_t *)calloc(1, sizeof(*tx));
   zc_video_rx_t *rx = (zc_video_rx_t *)calloc(1, sizeof(*rx));
   if (!tx || !rx ||
-      zc_video_tx_init(tx, RUDP_PAGE_POOL_PAGES, bitrate_bps,
-                       bitrate_bps / 4U, bitrate_bps * 2U, fec_shards,
+      zc_video_tx_init(tx, RUDP_PAGE_POOL_PAGES, zc_pace_bps(bitrate_bps, ZC_PACE_HEADROOM),
+                       bitrate_bps / 4U, zc_pace_bps(bitrate_bps, 2U * ZC_PACE_HEADROOM), fec_shards,
                        &impair, qpc_now_us()) != 0 ||
       zc_video_rx_init(rx, 20 * 1024 * 1024) != 0) {
     fprintf(stderr, "zcrudp video bridge init failed\n");
@@ -222,8 +222,24 @@ int main(int argc, char **argv) {
   uint32_t slice_frags = 4U;   /* transport fragments per protected slice */
   uint32_t slice_miss_q8 = 20U;
 
+  /* Frames start on their slot of the frame rate, as a capture would
+   * deliver them. Back to back, the bench sent faster than the frame rate
+   * and the pacer, holding the link to the bitrate, made every frame wait
+   * for the previous one: the TX row measured that, not the transport. */
+  const uint64_t frame_period_us = 1000000ULL / (fps ? fps : 120U);
+  uint64_t next_frame_us = qpc_now_us();
   for (uint32_t f = 0; f < (uint32_t)(num_frames + warmup); ++f) {
     if (show_window && !gpu_pipeline_pump_events(gpu)) break;
+    {
+      uint64_t now = qpc_now_us();
+      if (now < next_frame_us) {
+        if (next_frame_us - now > 1500U) Sleep((DWORD)((next_frame_us - now - 1000U) / 1000U));
+        while (qpc_now_us() < next_frame_us) YieldProcessor();
+      }
+      next_frame_us += frame_period_us;
+      now = qpc_now_us();
+      if (now > next_frame_us + frame_period_us) next_frame_us = now; /* fell behind: no catch-up burst */
+    }
 
     const uint8_t *bs = NULL;
     size_t bs_len = 0;
@@ -297,6 +313,7 @@ int main(int argc, char **argv) {
      * where a real one would send that list back. Every round costs a
      * round trip, which the latency rows below include. */
     const uint32_t rounds = has_impair ? (1U + max_resend) : 1U;
+    uint32_t done_round = UINT32_MAX;
     for (uint32_t round = 0; round < rounds; ++round) {
     if (round > 0) resent_rounds++;
     uint64_t t_tx0 = qpc_now_us();
@@ -435,14 +452,22 @@ int main(int argc, char **argv) {
         slice_miss_q8 = 20U;
       }
     }
-    if (got_mv && rx_slices >= num_slices) break;
+    if (got_mv && rx_slices >= num_slices) {
+      done_round = round;
+      break;
+    }
     } /* resend rounds */
     /* The encoder gets what is left of the link once headers, parity and
      * resends are paid for. */
     gpu_pipeline_set_bitrate(gpu, zc_rate_budget_update(&rate_budget, tx, bs_len));
 
-    if (tx->bytes_sent > wire_bytes_before) {
-      uint64_t owd_us = (tx_us + rx_us) / 2ULL;
+    /* Delay samples only from frames complete after the first round (Karn):
+     * a frame that needed resends measures the recovery, not the queue. */
+    if (tx->bytes_sent > wire_bytes_before && done_round == 0U) {
+      /* From the end of sending, as the live sender measures it: the time
+       * spent in the pacer is not network delay (counting it made the pacer
+       * cut its own rate on every large frame). */
+      uint64_t owd_us = rx_us;
       if (owd_us == 0ULL) owd_us = 1ULL;
       zc_video_tx_on_ack(tx, (uint32_t)owd_us,
                          (uint32_t)(tx->bytes_sent - wire_bytes_before), 0U);

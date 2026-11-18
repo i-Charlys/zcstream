@@ -160,6 +160,17 @@ typedef struct {
   uint64_t ooo_packets_seen;
 } zc_video_rx_t;
 
+/* The pacer runs this many times faster than the encoder's bitrate (and up
+ * to twice that when the delay feedback allows): at exactly the bitrate, a
+ * frame larger than average (start, scene cut, burst of motion) waits for
+ * the bucket and queues the frames behind it. Pacing only has to keep the
+ * link from bursting, as WebRTC's pacer does at 2.5x. */
+#define ZC_PACE_HEADROOM 2U
+static inline uint32_t zc_pace_bps(uint32_t bitrate_bps, uint32_t factor) {
+  uint64_t v = (uint64_t)bitrate_bps * factor;
+  return (v > 0xF0000000ULL) ? 0xF0000000U : (uint32_t)v;
+}
+
 int zc_video_tx_init(zc_video_tx_t *tx, size_t pool_pages,
                      uint32_t initial_bps, uint32_t min_bps,
                      uint32_t max_bps, uint8_t fec_shards,
