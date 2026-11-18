@@ -64,6 +64,10 @@ static void dump_bmp(gpu_pipeline_t *p, const char *path) {
 }
 
 int main(int argc, char **argv) {
+  if (argc < 5) {
+    fprintf(stderr, "usage: %s <image.raw | -> <vx> <vy> <mbps> [frames] [dump.bmp]" "\n", argv[0]);
+    return 2;
+  }
   const char *raw = argv[1];
   int vx = atoi(argv[2]), vy = atoi(argv[3]);
   uint32_t mbps = (uint32_t)atoi(argv[4]);
@@ -72,10 +76,6 @@ int main(int argc, char **argv) {
 
   uint8_t *img = (uint8_t *)malloc((size_t)W * H * 4);
   uint8_t *frm = (uint8_t *)malloc((size_t)W * H * 4);
-  if (argc < 5) {
-    fprintf(stderr, "usage: %s <image.raw | -> <vx> <vy> <mbps> [frames] [dump.bmp]" "\n", argv[0]);
-    return 2;
-  }
   if (strcmp(raw, "-") == 0) {
     /* Generated picture: smooth gradients, fine texture and sharp edges. */
     for (int y = 0; y < H; ++y) {
@@ -119,7 +119,7 @@ int main(int argc, char **argv) {
   uint64_t bytes = 0, mm_total = 0;
   double bd_bytes[3] = {0, 0, 0}; uint64_t bd_tq_rec = 0, bd_tq_blk = 0, bd_tq_chroma = 0; uint64_t bd_intra_px = 0, bd_delta_rec = 0; uint32_t bd_frames = 0;
   double cpsnr_sum = 0; uint32_t cpsnr_n = 0;
-  uint32_t n = 0, ec_frames = 0, rt_bad = 0, fuzz_runs = 0;
+  uint32_t n = 0, ec_frames = 0, rt_bad = 0, dec_err = 0, fuzz_runs = 0;
   uint32_t *rt_w = (uint32_t *)malloc(64u << 20);
   uint8_t *rt_a = (uint8_t *)malloc(64u << 20), *rt_b = (uint8_t *)malloc(64u << 20);
   for (uint32_t fr = 0; fr < total; ++fr) {
@@ -216,7 +216,7 @@ int main(int argc, char **argv) {
     bool kf = false;
     double c = 0, e = 0, d = 0, p = 0;
     if (gpu_pipeline_capture_and_encode(gpu, fr, &bs, &len, &kf, &c, &e) != 0) continue;
-    gpu_pipeline_decode_and_present(gpu, bs, len, &d, &p);
+    if (gpu_pipeline_decode_and_present(gpu, bs, len, &d, &p) != 0) dec_err++;
     {
       uint32_t hw = 0, mvb = 0;
       memcpy(&hw, bs, 4); memcpy(&mvb, bs + 4, 4);
@@ -346,14 +346,16 @@ int main(int argc, char **argv) {
         puts("]");
         ID3D11DeviceContext_Unmap(gpu->ctx, (ID3D11Resource *)gpu->tern_enc_mvs_stg[(gpu->tern_stg_idx + TERN_STG_RING - 1U) % TERN_STG_RING], 0);
       }
-      gpu_pipeline_ternary_ref_mismatch(gpu, &mm_total);
+      if (gpu_pipeline_ternary_ref_mismatch(gpu, &mm_total) != 0) dec_err++;
       if (dump) dump_bmp(gpu, dump);
     }
   }
+  uint32_t denom = (n > 0U) ? n : 1U;
   printf("v=(%d,%d) %u Mbps: moving psnr avg=%.2f min=%.2f  %.1f kB/frame (%.1f Mbps)  mismatch=%llu\n",
-         vx, vy, mbps, psnr_sum / n, psnr_min, (double)bytes / n / 1000.0,
-         (double)bytes / n * 8.0 * 120.0 / 1e6, (unsigned long long)mm_total);
-  printf("   enc avg=%.0f max=%.0f us, dec avg=%.0f us; ec frames %u/%u, roundtrip errors %u\n", enc_sum / n, enc_max, dec_sum / n, ec_frames, total, rt_bad);
+         vx, vy, mbps, psnr_sum / denom, n ? psnr_min : 0.0, (double)bytes / denom / 1000.0,
+         (double)bytes / denom * 8.0 * 120.0 / 1e6, (unsigned long long)mm_total);
+  printf("   enc avg=%.0f max=%.0f us, dec avg=%.0f us; ec frames %u/%u, roundtrip errors %u, decode errors %u\n",
+         enc_sum / denom, enc_max, dec_sum / denom, ec_frames, total, rt_bad, dec_err);
   if (bd_frames) printf("   per frame: delta %.1f kB (%.0f records, %.2f B each), intra %.1f kB (%.0f px, %.2f bits/px)\n",
       bd_bytes[0] / bd_frames / 1000.0, (double)bd_delta_rec / bd_frames, bd_bytes[0] / (bd_delta_rec ? bd_delta_rec : 1),
       bd_bytes[1] / bd_frames / 1000.0, (double)bd_intra_px / bd_frames, bd_bytes[1] * 8.0 / (bd_intra_px ? bd_intra_px : 1));
@@ -362,5 +364,10 @@ int main(int argc, char **argv) {
   if (cpsnr_n) printf("   chroma psnr (Cb/Cr mean) avg=%.2f" "\n", cpsnr_sum / cpsnr_n);
   if (fuzz_runs) printf("   fuzzed decodes: %u\n", fuzz_runs);
   gpu_pipeline_destroy(gpu);
-  return 0;
+  free(rt_w);
+  free(rt_a);
+  free(rt_b);
+  free(img);
+  free(frm);
+  return (dec_err != 0U || rt_bad != 0U || mm_total != 0ULL) ? 1 : 0;
 }

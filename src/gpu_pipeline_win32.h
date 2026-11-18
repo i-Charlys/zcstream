@@ -39,7 +39,7 @@ int gpu_pipeline_create(gpu_pipeline_t **out_pipe, uint32_t width,
                         bool show_window, gpu_pipeline_info_t *out_info);
 
 /**
- * Creates a GPU pipeline backed by tern_vid HLSL compute shaders (cs_5_0)
+ * Creates a GPU pipeline backed by zcvid HLSL compute shaders (cs_5_0)
  * for zero-copy VRAM ternary encoding/decoding.
  */
 int gpu_pipeline_create_ternary(gpu_pipeline_t **out_pipe, uint32_t width,

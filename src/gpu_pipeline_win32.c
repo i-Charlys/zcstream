@@ -990,9 +990,9 @@ static uint32_t tern_record_class(uint32_t w0, uint32_t *id) {
   return tag * 2U + bit29;
 }
 
-/* Worst case: 1 count byte per class, 5 gap bytes + 5 payload bytes per record. */
+/* Worst case: 5 count bytes per class, 4 gap bytes (28-bit ids) + 5 payload bytes per record (10U bound is conservative). */
 static size_t tern_pack_bound(uint32_t num_records) {
-  return 8U * 5U + (size_t)num_records * 10U;
+  return (size_t)TERN_CLASSES_MAX * 5U + (size_t)num_records * 10U;
 }
 
 /* Sorts records by (class, position). Returns the sorted keys, each
@@ -2042,13 +2042,13 @@ static uint8_t *tern_read_file(const char *path, size_t *len) {
 static int compile_hlsl_cs(ID3D11Device *dev, const char *filename,
                            const char *entry, ID3D11ComputeShader **out_cs) {
   const char *prefixes[4] = {
-#ifdef TERN_VID_SHADERS_DIR
-    TERN_VID_SHADERS_DIR "/",
+#ifdef ZCVID_SHADERS_DIR
+    ZCVID_SHADERS_DIR "/",
 #else
-    "../tern_vid/shaders/",
+    "../zcvid/shaders/",
 #endif
-    "../tern_vid/shaders/",
-    "../../tern_vid/shaders/",
+    "../zcvid/shaders/",
+    "../../zcvid/shaders/",
     "shaders/"
   };
   for (int i = 0; i < 4; ++i) {
@@ -2577,7 +2577,7 @@ int gpu_pipeline_create_ternary(gpu_pipeline_t **out_pipe, uint32_t width,
                                 uint32_t threshold, uint32_t delta_step,
                                 uint32_t gamma_q8, uint32_t neutral_y,
                                 bool show_window, gpu_pipeline_info_t *out_info) {
-  if (!out_pipe || !out_info || width == 0U || height == 0U) return -1;
+  if (!out_pipe || !out_info || width == 0U || height == 0U || (width & 1U) != 0U) return -1;
   gpu_pipeline_t *p = (gpu_pipeline_t *)calloc(1, sizeof(*p));
   if (!p) return -1;
 

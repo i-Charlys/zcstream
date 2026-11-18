@@ -15,7 +15,7 @@ Under simulated degraded network (`--nasty`: 5% random loss + 8% 3-pkt bursts + 
 
 ## Ternary HLSL pipeline (`zcrudp_ternary_bench.exe`)
 
-Third prototype: the [`tern_vid`](../tern_vid) compute shaders (`cs_5_0`)
+Third prototype: the [`zcvid`](../zcvid) compute shaders (`cs_5_0`)
 encode and decode YCbCr in VRAM with per-tile motion vectors. Motion vectors
 travel on the FEC-protected path, delta records on the unprotected one.
 
@@ -34,7 +34,7 @@ kept with black bars; capture restarts by itself after a mode switch.
 
 The shaders emit 8-byte records. `gpu_pipeline_ternary_set_packed` repacks
 them losslessly (sorted, gap-coded), and `gpu_pipeline_ternary_set_entropy`
-adds an adaptive range coder on top (the one in `tern_vid/include/ternary_entropy.h`):
+adds an adaptive range coder on top (the one in `zcvid/include/ternary_entropy.h`):
 trits are coded under the context of their left and upper neighbours, intra
 samples as the error of a left/up/up-left prediction. Still lossless, and the
 rate control spends the saving on more records. Measured on a 1920x1080 game
@@ -317,7 +317,7 @@ to fail on the connected `WSA_FLAG_REGISTERED_IO` socket these benchmarks use.
 
 ## Build (Windows, Clang + CMake)
 
-1. Place `zcrudp` at `../zcrudp` and `tern_vid` at `../tern_vid`.
+1. Place `zcrudp` at `../zcrudp` and `zcvid` at `../zcvid`.
 2. Download `nvEncodeAPI.h` (from `FFmpeg/nv-codec-headers`) into `third_party/nvEncodeAPI.h`.
 3. Optional for `zcrudp_pyrowave_bench`: place `Themaister/pyrowave` (with `Granite`, `volk`, `Vulkan-Headers`) in `third_party/pyrowave-master` and build `libpyrowave.a`.
 4. Configure & build:

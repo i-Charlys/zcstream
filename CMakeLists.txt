@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(zcrudp_streaming LANGUAGES C CXX)
+project(zcstream LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -11,9 +11,9 @@ if(NOT EXISTS "${ZCRUDP_DIR}/include/rudp_nextgen.h")
   message(FATAL_ERROR "zcrudp not found at ${ZCRUDP_DIR}")
 endif()
 
-set(TERN_VID_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../tern_vid")
-if(NOT EXISTS "${TERN_VID_DIR}/include/ternary_zcrudp_bridge.h")
-  message(FATAL_ERROR "tern_vid not found at ${TERN_VID_DIR}")
+set(ZCVID_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../zcvid")
+if(NOT EXISTS "${ZCVID_DIR}/include/ternary_zcrudp_bridge.h")
+  message(FATAL_ERROR "zcvid not found at ${ZCVID_DIR}")
 endif()
 
 set(ZCRUDP_SOURCES
@@ -50,7 +50,7 @@ add_executable(test_video_bridge
 )
 target_include_directories(test_video_bridge PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
-  "${TERN_VID_DIR}/include"
+  "${ZCVID_DIR}/include"
 )
 target_link_libraries(test_video_bridge PRIVATE zcrudp_lib ws2_32)
 if(NOT MSVC)
@@ -66,7 +66,7 @@ add_executable(zcrudp_stream_bench
 
 target_include_directories(zcrudp_stream_bench PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
-  "${TERN_VID_DIR}/include"
+  "${ZCVID_DIR}/include"
 )
 
 target_link_libraries(zcrudp_stream_bench PRIVATE
@@ -86,7 +86,7 @@ target_link_libraries(zcrudp_stream_bench PRIVATE
 )
 
 target_compile_definitions(zcrudp_stream_bench PRIVATE
-  TERN_VID_SHADERS_DIR="${TERN_VID_DIR}/shaders"
+  ZCVID_SHADERS_DIR="${ZCVID_DIR}/shaders"
 )
 
 if(MSVC)
@@ -104,7 +104,7 @@ if(EXISTS "${PYROWAVE_BUILD_DIR}/libpyrowave.a")
     src/zcrudp_video_bridge.c
   )
   target_include_directories(zcrudp_pyrowave_bench PRIVATE
-    "${TERN_VID_DIR}/include"
+    "${ZCVID_DIR}/include"
     "${PYROWAVE_SRC_DIR}"
     "${PYROWAVE_SRC_DIR}/Granite/util"
     "${PYROWAVE_SRC_DIR}/Granite/math"
@@ -134,11 +134,11 @@ add_executable(zcrudp_ternary_bench
 
 target_include_directories(zcrudp_ternary_bench PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
-  "${TERN_VID_DIR}/include"
+  "${ZCVID_DIR}/include"
 )
 
 target_compile_definitions(zcrudp_ternary_bench PRIVATE
-  TERN_VID_SHADERS_DIR="${TERN_VID_DIR}/shaders"
+  ZCVID_SHADERS_DIR="${ZCVID_DIR}/shaders"
 )
 
 target_link_libraries(zcrudp_ternary_bench PRIVATE
@@ -169,10 +169,10 @@ add_executable(ternary_motion_bench tests/ternary_motion_bench.c)
 target_include_directories(ternary_motion_bench PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
-  "${TERN_VID_DIR}/include"
+  "${ZCVID_DIR}/include"
 )
 target_compile_definitions(ternary_motion_bench PRIVATE
-  TERN_VID_SHADERS_DIR="${TERN_VID_DIR}/shaders"
+  ZCVID_SHADERS_DIR="${ZCVID_DIR}/shaders"
 )
 target_link_libraries(ternary_motion_bench PRIVATE
   zcrudp_lib d3d11 dxgi dxguid d3dcompiler mfplat mfuuid mfreadwrite
@@ -218,12 +218,12 @@ add_executable(zcrudp_stream
 
 target_include_directories(zcrudp_stream PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
-  "${TERN_VID_DIR}/include"
+  "${ZCVID_DIR}/include"
   "${ZPSYNC_DIR}/include"
 )
 
 target_compile_definitions(zcrudp_stream PRIVATE
-  TERN_VID_SHADERS_DIR="${TERN_VID_DIR}/shaders"
+  ZCVID_SHADERS_DIR="${ZCVID_DIR}/shaders"
 )
 
 target_link_libraries(zcrudp_stream PRIVATE
