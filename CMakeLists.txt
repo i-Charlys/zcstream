@@ -45,6 +45,8 @@ function(zc_resolve_repo OUT_VAR REPO_NAME CHECK_REL GIT_URL GIT_TAG)
   endif()
   list(APPEND _candidates
     "${CMAKE_CURRENT_SOURCE_DIR}/../${REPO_NAME}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../${REPO_NAME}-main"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../${REPO_NAME}-src"
     "${CMAKE_CURRENT_SOURCE_DIR}/deps/${REPO_NAME}"
     "${CMAKE_CURRENT_BINARY_DIR}/_deps/${REPO_NAME}-src"
   )
@@ -298,9 +300,6 @@ if(WIN32 AND NOT ZCRUDP_PORTABLE_CODEC)
       target_include_directories(${target} PRIVATE "${ZC_NVENC_INCLUDE_DIR}")
       target_compile_definitions(${target} PRIVATE ZC_HAVE_NVENC=1)
     endif()
-    target_compile_definitions(${target} PRIVATE
-      ZCVID_SHADERS_DIR="${ZCVID_DIR}/shaders"
-    )
     add_custom_command(TARGET ${target} POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${target}>/shaders"
       COMMAND ${CMAKE_COMMAND} -E copy_if_different

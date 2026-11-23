@@ -3439,7 +3439,7 @@ static int compile_hlsl_cs(ID3D11Device *dev, const char *filename,
     }
   }
 
-  const char *prefixes[6] = {
+  const char *prefixes[9] = {
     env_shaders[0] ? env_shaders : NULL,
     exe_shaders[0] ? exe_shaders : NULL,
     "shaders/",
@@ -3448,10 +3448,13 @@ static int compile_hlsl_cs(ID3D11Device *dev, const char *filename,
 #else
     NULL,
 #endif
+    "_deps/zcvid-src/shaders/",
+    "../_deps/zcvid-src/shaders/",
     "../zcvid/shaders/",
+    "../zcvid-main/shaders/",
     "../../zcvid/shaders/"
   };
-  for (int i = 0; i < 6; ++i) {
+  for (int i = 0; i < 9; ++i) {
     if (!prefixes[i]) continue;
     char path[MAX_PATH];
     snprintf(path, sizeof(path), "%s%s", prefixes[i], filename);
