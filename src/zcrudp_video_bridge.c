@@ -1,13 +1,38 @@
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <mswsock.h>
+typedef SOCKET zc_sock_t;
+#else
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#ifdef __APPLE__
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE 1
+#endif
+#endif
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/mman.h>
+#include <sys/uio.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <time.h>
+#include <sched.h>
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+typedef int zc_sock_t;
+#endif
 
 #include "zcrudp_video_bridge.h"
-#include "ternary_zcrudp_bridge.h"
+#include "zcvid_zcrudp_bridge.h"
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
 /* Winsock Registered I/O (RIO) ABI definitions (host OS layer) */
 typedef struct RIO_BUFFERID_t *ZC_RIO_BUFFERID;
 typedef struct RIO_CQ_t *ZC_RIO_CQ;
@@ -78,12 +103,13 @@ typedef struct {
   bool deferred; /* Sends queued with RIO_MSG_DEFER awaiting a commit */
 } zc_rio_state_t;
 
-_Static_assert(sizeof(zc_video_hdr_t) == 16, "zc_video_hdr_t is a 16-byte wire header");
-
 /* One RIO ring slot: header + payload rounded up to a cache line. */
 #define ZC_RIO_SLOT_BYTES \
   ((uint32_t)((sizeof(zc_video_hdr_t) + ZC_FRAG_MTU + 63U) & ~(size_t)63U))
 #define ZC_RIO_MAX_OUTSTANDING 8192U
+#endif /* _WIN32 */
+
+_Static_assert(sizeof(zc_video_hdr_t) == 16, "zc_video_hdr_t is a 16-byte wire header");
 
 static uint32_t xorshift32(uint32_t *state) {
   uint32_t x = *state;
@@ -154,6 +180,7 @@ int zc_video_tx_init(zc_video_tx_t *tx, size_t pool_pages,
   if (impair) {
     tx->impair = *impair;
   }
+#ifdef _WIN32
   tx->pool_backing = (uint8_t *)VirtualAlloc(
       NULL, pool_pages * RUDP_PAGE_SIZE, MEM_COMMIT | MEM_RESERVE,
       PAGE_READWRITE);
@@ -162,11 +189,24 @@ int zc_video_tx_init(zc_video_tx_t *tx, size_t pool_pages,
   }
   /* Best effort: locking fails without a raised working-set quota. */
   (void)VirtualLock(tx->pool_backing, pool_pages * RUDP_PAGE_SIZE);
+#else
+  void *mem = mmap(NULL, pool_pages * RUDP_PAGE_SIZE, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mem == MAP_FAILED) {
+    return -1;
+  }
+  tx->pool_backing = (uint8_t *)mem;
+  (void)mlock(tx->pool_backing, pool_pages * RUDP_PAGE_SIZE);
+#endif
 
   if (rudp_page_pool_init(&tx->page_pool, tx->pool_backing, pool_pages) != 0 ||
       rudp_pacer_init(&tx->pacer, initial_bps / 8U, min_bps / 8U, max_bps / 8U,
                       2000U, now_us) != 0) {
+#ifdef _WIN32
     VirtualFree(tx->pool_backing, 0, MEM_RELEASE);
+#else
+    munmap(tx->pool_backing, pool_pages * RUDP_PAGE_SIZE);
+#endif
     tx->pool_backing = NULL;
     return -1;
   }
@@ -174,6 +214,7 @@ int zc_video_tx_init(zc_video_tx_t *tx, size_t pool_pages,
 }
 
 int zc_video_tx_enable_rio(zc_video_tx_t *tx, uintptr_t connected_udp_sock) {
+#ifdef _WIN32
   if (!tx || !tx->pool_backing || tx->rio_state) return -1;
   SOCKET sock = (SOCKET)connected_udp_sock;
   GUID rio_guid = {0x8509e081, 0x96dd, 0x4005,
@@ -221,8 +262,14 @@ int zc_video_tx_enable_rio(zc_video_tx_t *tx, uintptr_t connected_udp_sock) {
   tx->rio_state = rs;
   tx->rio_ready = true;
   return 0;
+#else
+  (void)tx;
+  (void)connected_udp_sock;
+  return -1;
+#endif
 }
 
+#ifdef _WIN32
 static void rio_reap(zc_video_tx_t *tx, zc_rio_state_t *rs) {
   ZC_RIORESULT results[256];
   ULONG done;
@@ -249,6 +296,7 @@ static void rio_commit(zc_video_tx_t *tx, zc_rio_state_t *rs) {
     rs->deferred = false;
   }
 }
+#endif /* _WIN32 */
 
 void zc_video_tx_destroy(zc_video_tx_t *tx) {
   if (!tx) return;
@@ -258,6 +306,7 @@ void zc_video_tx_destroy(zc_video_tx_t *tx) {
     tx->history = NULL;
     tx->history_frames = 0;
   }
+#ifdef _WIN32
   if (tx->rio_state) {
     zc_rio_state_t *rs = (zc_rio_state_t *)tx->rio_state;
     for (unsigned spin = 0; rs->inflight > 0 && spin < 20000U; ++spin) {
@@ -286,8 +335,16 @@ void zc_video_tx_destroy(zc_video_tx_t *tx) {
     VirtualFree(tx->pool_backing, 0, MEM_RELEASE);
     tx->pool_backing = NULL;
   }
+#else
+  if (tx->pool_backing) {
+    (void)munlock(tx->pool_backing, tx->pool_pages * RUDP_PAGE_SIZE);
+    munmap(tx->pool_backing, tx->pool_pages * RUDP_PAGE_SIZE);
+    tx->pool_backing = NULL;
+  }
+#endif
 }
 
+#ifdef _WIN32
 /* Copies one datagram into the registered ring and queues it (deferred). */
 static bool rio_queue_datagram(zc_video_tx_t *tx, const uint8_t *hdr,
                                size_t hdr_len, const uint8_t *payload,
@@ -328,15 +385,17 @@ static bool rio_queue_datagram(zc_video_tx_t *tx, const uint8_t *hdr,
   rs->ring_cursor += ZC_RIO_SLOT_BYTES;
   return true;
 }
+#endif /* _WIN32 */
 
 /*
  * Single exit point to the OS for every datagram: header + payload through
- * RIO when enabled, a scatter-gather WSASendTo otherwise.
+ * RIO when enabled (Windows), scatter-gather WSASendTo (Windows) or sendmsg (POSIX).
  */
-static bool tx_emit(zc_video_tx_t *tx, SOCKET sock, const struct sockaddr *dst,
+static bool tx_emit(zc_video_tx_t *tx, zc_sock_t sock, const struct sockaddr *dst,
                     int dst_len, const uint8_t *hdr, size_t hdr_len,
                     const uint8_t *payload, size_t payload_len) {
   bool ok;
+#ifdef _WIN32
   if (tx->rio_ready) {
     ok = rio_queue_datagram(tx, hdr, hdr_len, payload, payload_len);
   } else {
@@ -356,6 +415,27 @@ static bool tx_emit(zc_video_tx_t *tx, SOCKET sock, const struct sockaddr *dst,
     ok = nbufs > 0 &&
          WSASendTo(sock, bufs, nbufs, &sent, 0, dst, dst_len, NULL, NULL) == 0;
   }
+#else
+  struct iovec iov[2];
+  size_t niov = 0;
+  if (hdr_len) {
+    iov[niov].iov_base = (void *)(uintptr_t)hdr;
+    iov[niov].iov_len = hdr_len;
+    niov++;
+  }
+  if (payload_len) {
+    iov[niov].iov_base = (void *)(uintptr_t)payload;
+    iov[niov].iov_len = payload_len;
+    niov++;
+  }
+  struct msghdr msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.msg_name = (void *)(uintptr_t)dst;
+  msg.msg_namelen = (socklen_t)dst_len;
+  msg.msg_iov = iov;
+  msg.msg_iovlen = niov;
+  ok = niov > 0 && sendmsg(sock, &msg, 0) >= 0;
+#endif
   if (ok) {
     tx->bytes_sent += hdr_len + payload_len;
     tx->packets_sent++;
@@ -366,18 +446,28 @@ static bool tx_emit(zc_video_tx_t *tx, SOCKET sock, const struct sockaddr *dst,
 }
 
 static void tx_flush(zc_video_tx_t *tx) {
+#ifdef _WIN32
   if (tx->rio_ready) {
     zc_rio_state_t *rs = (zc_rio_state_t *)tx->rio_state;
     rio_commit(tx, rs);
     rio_reap(tx, rs);
   }
+#else
+  (void)tx;
+#endif
 }
 
 static uint64_t bridge_now_us(void) {
+#ifdef _WIN32
   LARGE_INTEGER f, c;
   QueryPerformanceFrequency(&f);
   QueryPerformanceCounter(&c);
   return (uint64_t)((c.QuadPart * 1000000LL) / f.QuadPart);
+#else
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+#endif
 }
 
 /* Refill tokens, pace when token-limited, and charge wire_bytes (including
@@ -399,10 +489,21 @@ static void tx_pace_packet(zc_video_tx_t *tx, uint32_t wire_bytes,
       if (wait_us > 50000U) wait_us = 50000U;
       uint64_t t0 = bridge_now_us();
       if (wait_us >= 2000U) {
+#ifdef _WIN32
         Sleep(wait_us / 1000U);
+#else
+        struct timespec req;
+        req.tv_sec = (time_t)(wait_us / 1000000U);
+        req.tv_nsec = (long)((wait_us % 1000000U) * 1000U);
+        nanosleep(&req, NULL);
+#endif
       }
       while (bridge_now_us() - t0 < wait_us) {
+#ifdef _WIN32
         YieldProcessor();
+#else
+        sched_yield();
+#endif
       }
       uint64_t elapsed = bridge_now_us() - t0;
       *cur_us += (elapsed > 0U) ? elapsed : wait_us;
@@ -437,7 +538,7 @@ static bool impair_roll(zc_video_tx_t *tx, int pct) {
   return pct > 0 && (int)(xorshift32(&tx->impair_rng) % 100U) < pct;
 }
 
-static void emit_with_impair(zc_video_tx_t *tx, SOCKET sock,
+static void emit_with_impair(zc_video_tx_t *tx, zc_sock_t sock,
                              const struct sockaddr *dst, int dst_len,
                              const zc_video_hdr_t *hdr, const uint8_t *payload,
                              uint64_t now_us, bool apply_impair) {
@@ -493,7 +594,7 @@ int zc_video_tx_flush_net(zc_video_tx_t *tx, uintptr_t udp_sock,
                           const void *dst_addr, int dst_addr_len,
                           uint64_t now_us) {
   if (!tx || !dst_addr) return -1;
-  SOCKET sock = (SOCKET)udp_sock;
+  zc_sock_t sock = (zc_sock_t)udp_sock;
   const struct sockaddr *dst = (const struct sockaddr *)dst_addr;
   int flushed = 0;
 
@@ -547,7 +648,7 @@ int zc_video_tx_send_frame(zc_video_tx_t *tx, uintptr_t udp_sock,
     memset(parity_data[p], 0, ZC_FRAG_MTU);
   }
 
-  SOCKET sock = (SOCKET)udp_sock;
+  zc_sock_t sock = (zc_sock_t)udp_sock;
   const struct sockaddr *dst = (const struct sockaddr *)dst_addr;
   uint64_t cur_us = now_us;
 
@@ -633,7 +734,7 @@ int zc_video_tx_resend(zc_video_tx_t *tx, uintptr_t udp_sock,
   hdr.parity_count = e->fec_shards;
   hdr.flags = e->keyframe ? ZC_VIDEO_FLAG_KEYFRAME : 0U;
 
-  SOCKET sock = (SOCKET)udp_sock;
+  zc_sock_t sock = (zc_sock_t)udp_sock;
   const struct sockaddr *dst = (const struct sockaddr *)dst_addr;
   uint64_t cur_us = now_us;
   uint32_t n = (count > 0U) ? count : total_frags;
@@ -694,9 +795,18 @@ int zc_video_rx_init(zc_video_rx_t *rx, size_t max_frame_bytes) {
   rx->frame_cap = max_frame_bytes;
   for (uint32_t i = 0; i < ZC_RX_SLOTS; ++i) {
     zc_video_rx_slot_t *s = &rx->slots[i];
+#ifdef _WIN32
     /* Address space only: a slot commits what its largest frame needed, so
      * the slots that only ever see small frames stay small. */
     s->buf = (uint8_t *)VirtualAlloc(NULL, max_frame_bytes, MEM_RESERVE, PAGE_READWRITE);
+#else
+    /* Anonymous mmap is demand-paged on Linux and macOS: untouched pages
+     * consume no physical RAM. */
+    void *mem = mmap(NULL, max_frame_bytes, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    s->buf = (mem == MAP_FAILED) ? NULL : (uint8_t *)mem;
+    s->buf_committed = (mem == MAP_FAILED) ? 0U : max_frame_bytes;
+#endif
     s->parity_buf = (uint8_t *)malloc(ZC_MAX_PARITY_SHARDS * ZC_FRAG_MTU);
     s->frag_lens = (uint16_t *)malloc(ZC_MAX_FRAGS_PER_FRAME * sizeof(uint16_t));
     s->frag_present = (uint8_t *)malloc(ZC_MAX_FRAGS_PER_FRAME);
@@ -705,6 +815,7 @@ int zc_video_rx_init(zc_video_rx_t *rx, size_t max_frame_bytes) {
       return -1;
     }
   }
+#ifdef _WIN32
   /* Slot 0 is what callers read before any frame completed. */
   if (!VirtualAlloc(rx->slots[0].buf, max_frame_bytes, MEM_COMMIT, PAGE_READWRITE)) {
     zc_video_rx_destroy(rx);
@@ -722,6 +833,12 @@ int zc_video_rx_init(zc_video_rx_t *rx, size_t max_frame_bytes) {
       s->buf_committed = c;
     }
   }
+#else
+  for (uint32_t i = 1; i < ZC_RX_SLOTS; ++i) {
+    size_t c = (ZC_RX_SLOT_COMMIT < max_frame_bytes) ? ZC_RX_SLOT_COMMIT : max_frame_bytes;
+    memset(rx->slots[i].buf, 0, c);
+  }
+#endif
   for (uint32_t i = 0; i < ZC_RX_SLOTS; ++i) {
     memset(rx->slots[i].parity_buf, 0, ZC_MAX_PARITY_SHARDS * ZC_FRAG_MTU);
     memset(rx->slots[i].frag_lens, 0, ZC_MAX_FRAGS_PER_FRAME * sizeof(uint16_t));
@@ -736,7 +853,11 @@ void zc_video_rx_destroy(zc_video_rx_t *rx) {
   if (!rx) return;
   for (uint32_t i = 0; i < ZC_RX_SLOTS; ++i) {
     zc_video_rx_slot_t *s = &rx->slots[i];
+#ifdef _WIN32
     if (s->buf) VirtualFree(s->buf, 0, MEM_RELEASE);
+#else
+    if (s->buf) munmap(s->buf, rx->frame_cap);
+#endif
     free(s->parity_buf);
     free(s->frag_lens);
     free(s->frag_present);
@@ -756,6 +877,7 @@ static void rx_release_slot(zc_video_rx_t *rx, zc_video_rx_slot_t *s) {
 
 static bool rx_start_frame(zc_video_rx_slot_t *s, const zc_video_hdr_t *hdr,
                            size_t frame_cap) {
+#ifdef _WIN32
   size_t need = (size_t)hdr->total_frags * ZC_FRAG_MTU;
   if (need > frame_cap) need = frame_cap;
   if (need > s->buf_committed) {
@@ -764,6 +886,9 @@ static bool rx_start_frame(zc_video_rx_slot_t *s, const zc_video_hdr_t *hdr,
     if (!VirtualAlloc(s->buf, need, MEM_COMMIT, PAGE_READWRITE)) return false;
     s->buf_committed = need;
   }
+#else
+  (void)frame_cap;
+#endif
   s->used = true;
   s->complete = false;
   s->fec_used = false;
@@ -1184,14 +1309,14 @@ int zc_video_rx_feed(zc_video_rx_t *rx, const uint8_t *pkt, size_t pkt_len,
   return 1;
 }
 
-int zc_video_tx_send_ternary_packet(zc_video_tx_t *tx, uintptr_t udp_sock,
+int zc_video_tx_send_zcvid_packet(zc_video_tx_t *tx, uintptr_t udp_sock,
                                     const void *dst_addr, int dst_addr_len,
                                     uint32_t pkt_seq_id, const uint8_t *pkt,
                                     size_t pkt_len, uint64_t now_us,
                                     bool apply_impair) {
   if (!tx || !pkt || pkt_len == 0) return -1;
-  bool reliable = zcrudp_ternary_route_packet(pkt, pkt_len) ==
-                  ZCRUDP_TERNARY_CHAN_RELIABLE_FEC;
+  bool reliable = zcrudp_zcvid_route_packet(pkt, pkt_len) ==
+                  ZCRUDP_ZCVID_CHAN_RELIABLE_FEC;
   /* INTRA / TILE_MV always get at least one parity shard; DELTA gets none. */
   uint8_t saved_fec = tx->fec_shards;
   tx->fec_shards = reliable ? ((saved_fec > 0) ? saved_fec : 1U) : 0U;

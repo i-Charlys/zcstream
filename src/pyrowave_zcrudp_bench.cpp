@@ -77,13 +77,21 @@ static YCbCrImages create_ycbcr_images(Device &device, int width, int height,
 int main(int argc, char **argv) {
   int width = 1920;
   int height = 1080;
+  uint32_t fps = 120;
   uint32_t target_frame_bytes = 125000; /* ~120 Mbps @ 120fps */
   size_t num_frames = 200;
   uint8_t fec_shards = 0;
+  bool use_rio = true;
   zc_net_impair_t impair = {};
 
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "--fec") == 0 && i + 1 < argc) fec_shards = (uint8_t)atoi(argv[++i]);
+    else if (strcmp(argv[i], "--no-fec") == 0) fec_shards = 0;
+    else if (strcmp(argv[i], "--no-rio") == 0) use_rio = false;
+    else if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
+      int v = atoi(argv[++i]);
+      fps = (v > 0) ? (uint32_t)v : 120U;
+    }
     else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) num_frames = (size_t)atoi(argv[++i]);
     else if (strcmp(argv[i], "--target-bytes") == 0 && i + 1 < argc) target_frame_bytes = (uint32_t)atoi(argv[++i]);
     else if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) width = atoi(argv[++i]);
@@ -110,6 +118,8 @@ int main(int argc, char **argv) {
 
   QueryPerformanceFrequency(&g_qpc_freq);
   timeBeginPeriod(1);
+  HANDLE pace_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                             TIMER_ALL_ACCESS);
 
   WSADATA wsa;
   if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
@@ -118,8 +128,9 @@ int main(int argc, char **argv) {
   }
 
   SOCKET rx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-  SOCKET tx_sock = WSASocketA(AF_INET, SOCK_DGRAM, IPPROTO_UDP, nullptr, 0,
-                              WSA_FLAG_REGISTERED_IO);
+  SOCKET tx_sock = use_rio
+      ? WSASocketA(AF_INET, SOCK_DGRAM, IPPROTO_UDP, nullptr, 0, WSA_FLAG_REGISTERED_IO)
+      : INVALID_SOCKET;
   bool rio_socket = (tx_sock != INVALID_SOCKET);
   if (!rio_socket) {
     tx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -224,11 +235,16 @@ int main(int argc, char **argv) {
 
   zc_video_tx_t *tx = (zc_video_tx_t *)calloc(1, sizeof(*tx));
   zc_video_rx_t *rx = (zc_video_rx_t *)calloc(1, sizeof(*rx));
-  uint32_t bps_est = target_frame_bytes * 8U * 120U;
+  uint64_t bps_est64 = (uint64_t)target_frame_bytes * 8ULL * (uint64_t)fps;
+  if (bps_est64 < 4000000ULL) bps_est64 = 4000000ULL;
+  if (bps_est64 > 2000000000ULL) bps_est64 = 2000000000ULL;
+  uint32_t bps_est = (uint32_t)bps_est64;
+  size_t rx_buf_sz = std::max<size_t>(2 * 1024 * 1024, (size_t)target_frame_bytes * 2U + 65536U);
   if (!tx || !rx ||
-      zc_video_tx_init(tx, RUDP_PAGE_POOL_PAGES, bps_est, bps_est / 4U,
-                       bps_est * 2U, fec_shards, &impair, qpc_now_us()) != 0 ||
-      zc_video_rx_init(rx, 2 * 1024 * 1024) != 0) {
+      zc_video_tx_init(tx, RUDP_PAGE_POOL_PAGES, zc_pace_bps(bps_est, ZC_PACE_HEADROOM),
+                       bps_est / 4U, zc_pace_bps(bps_est, 2U * ZC_PACE_HEADROOM),
+                       fec_shards, &impair, qpc_now_us()) != 0 ||
+      zc_video_rx_init(rx, rx_buf_sz) != 0) {
     fprintf(stderr, "zcrudp bridge init failed\n");
     return 1;
   }
@@ -250,10 +266,10 @@ int main(int argc, char **argv) {
 
   printf("=== Pyrowave (Vulkan Wavelet GPU) + zcrudp::nextgen ===\n");
   printf("GPU Adapter   : %s (Vulkan)\n", props.deviceName);
-  printf("Codec         : Pyrowave Wavelet (%s decode) | %dx%d Chroma420\n",
-         frag_dec ? "Fragment" : "Compute", width, height);
-  printf("Target Frame  : %u bytes (~%u Mbps @ 120fps) | Cauchy FEC=%u shards\n\n",
-         target_frame_bytes, (target_frame_bytes * 8U * 120U) / 1000000U, fec_shards);
+  printf("Video Encoder : Pyrowave Wavelet (%s decode) | %dx%d @ %ufps Chroma420\n",
+         frag_dec ? "Fragment" : "Compute", width, height, fps);
+  printf("Target Frame  : %u bytes (~%.1f Mbps @ %ufps) | Cauchy FEC=%u shards\n\n",
+         target_frame_bytes, (double)bps_est64 / 1e6, fps, fec_shards);
 
   std::vector<uint8_t> pkt_buf(target_frame_bytes + 65536);
   std::vector<double> enc_arr, ntx_arr, nrx_arr, dec_arr, tot_arr;
@@ -268,7 +284,32 @@ int main(int argc, char **argv) {
                     impair.reorder_pct > 0 || impair.dup_pct > 0);
   Fence fence;
 
+  /* Frames start on their slot of the frame rate, as a capture would deliver
+   * them (same pacing as zcvid_zcrudp_bench). Sent back to back, the pacer
+   * made each frame wait for the previous one and the TX/total rows measured
+   * that queueing instead of the transport. */
+  const uint64_t frame_period_us = 1000000ULL / (fps ? fps : 120U);
+  uint64_t next_frame_us = qpc_now_us();
   for (uint32_t f = 0; f < (uint32_t)(num_frames + warmup); ++f) {
+    {
+      uint64_t now = qpc_now_us();
+      if (now < next_frame_us) {
+        uint64_t rem = next_frame_us - now;
+        if (pace_timer && rem > 600ULL) {
+          LARGE_INTEGER due;
+          due.QuadPart = -(LONGLONG)((rem - 350ULL) * 10ULL);
+          if (SetWaitableTimer(pace_timer, &due, 0, NULL, NULL, FALSE)) {
+            WaitForSingleObject(pace_timer, INFINITE);
+          }
+        } else if (rem > 1500ULL) {
+          Sleep((DWORD)((rem - 1000ULL) / 1000ULL));
+        }
+        while (qpc_now_us() < next_frame_us) YieldProcessor();
+      }
+      next_frame_us += frame_period_us;
+      now = qpc_now_us();
+      if (now > next_frame_us + frame_period_us) next_frame_us = now; /* fell behind: no catch-up burst */
+    }
     LARGE_INTEGER t0, t1, t2, t3, t4;
     QueryPerformanceCounter(&t0);
 
@@ -289,7 +330,7 @@ int main(int argc, char **argv) {
     }
 
     PyroWave::Encoder::Packet packet = {};
-    enc.packetize(&packet, target_frame_bytes, pkt_buf.data(), pkt_buf.size(),
+    enc.packetize(&packet, pkt_buf.size(), pkt_buf.data(), pkt_buf.size(),
                   device.map_host_buffer(*meta_host, MEMORY_ACCESS_READ_BIT),
                   device.map_host_buffer(*bs_host, MEMORY_ACCESS_READ_BIT));
 
@@ -376,13 +417,23 @@ int main(int argc, char **argv) {
     }
   }
 
-  printf("Measured Frames: %zu / %zu | Avg Wavelet Frame: %.1f KB\n",
-         tot_arr.size(), num_frames,
-         tot_arr.empty() ? 0.0 : ((double)total_payload_bytes / (double)tot_arr.size() / 1024.0));
-  printf("Network TX/RX  : %llu pkts sent | %llu completed | %llu FEC-recovered\n\n",
+  double avg_kb = tot_arr.empty() ? 0.0 : ((double)total_payload_bytes / (double)tot_arr.size() / 1024.0);
+  double avg_mbps = tot_arr.empty() ? 0.0 : (((double)total_payload_bytes / (double)tot_arr.size()) * 8.0 * (double)fps / 1e6);
+  double deliv_pct = num_frames ? (100.0 * (double)tot_arr.size() / (double)num_frames) : 0.0;
+  printf("Frames Sent    : %zu | Delivered & Decoded: %zu (%.1f%%)\n",
+         num_frames, tot_arr.size(), deliv_pct);
+  printf("Avg bitrate    : %.2f Mbps (%.1f KB/frame)\n", avg_mbps, avg_kb);
+  printf("Network TX     : %llu sent | %llu dropped | %llu reordered | %llu dup | %llu FEC | %llu errors\n",
          (unsigned long long)tx->packets_sent,
+         (unsigned long long)tx->packets_dropped_sim,
+         (unsigned long long)tx->packets_reordered_sim,
+         (unsigned long long)tx->packets_duplicated_sim,
+         (unsigned long long)tx->fec_packets_sent,
+         (unsigned long long)tx->send_errors);
+  printf("Network RX     : %llu completed | %llu FEC-recovered | %llu dropped\n\n",
          (unsigned long long)rx->frames_completed,
-         (unsigned long long)rx->frames_fec_recovered);
+         (unsigned long long)rx->frames_fec_recovered,
+         (unsigned long long)rx->frames_dropped);
 
   printf("--- Pyrowave + zcrudp Pipeline Latency Breakdown (microseconds) ---\n");
   print_stat_row("1. Pyrowave Encode", enc_arr);
@@ -400,6 +451,7 @@ int main(int argc, char **argv) {
   closesocket(rx_sock);
   closesocket(tx_sock);
   WSACleanup();
+  if (pace_timer) CloseHandle(pace_timer);
   timeEndPeriod(1);
   return 0;
 }

@@ -3,10 +3,34 @@
  * recovery (exact bytes and exact length), header validation and the
  * single-datagram slice path. No GPU required.
  */
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+typedef SOCKET zc_sock_t;
+typedef int zc_socklen_t;
+#define ZC_INVALID_SOCK INVALID_SOCKET
+#define zc_close_sock(s) closesocket(s)
+#define zc_yield() Sleep(0)
+#else
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <time.h>
+#include <sched.h>
+typedef int zc_sock_t;
+typedef socklen_t zc_socklen_t;
+#define ZC_INVALID_SOCK (-1)
+#define zc_close_sock(s) close(s)
+#define zc_yield() sched_yield()
+#endif
 
 #include "zcrudp_video_bridge.h"
 
@@ -25,17 +49,23 @@
 #define MAX_PKTS 256
 #define PKT_CAP (sizeof(zc_video_hdr_t) + ZC_FRAG_MTU)
 
-static SOCKET g_rx_sock, g_tx_sock;
+static zc_sock_t g_rx_sock, g_tx_sock;
 static struct sockaddr_in g_addr;
-static int g_addr_len;
+static zc_socklen_t g_addr_len;
 static uint8_t g_pkts[MAX_PKTS][PKT_CAP];
 static int g_pkt_lens[MAX_PKTS];
 
 static uint64_t now_us(void) {
+#ifdef _WIN32
   LARGE_INTEGER f, c;
   QueryPerformanceFrequency(&f);
   QueryPerformanceCounter(&c);
   return (uint64_t)((c.QuadPart * 1000000LL) / f.QuadPart);
+#else
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+#endif
 }
 
 static void fill_pattern(uint8_t *buf, size_t len, uint32_t seed) {
@@ -51,11 +81,11 @@ static void collect(int expected) {
   int got = 0;
   CHECK(expected <= MAX_PKTS);
   while (got < expected && now_us() < deadline) {
-    int n = recv(g_rx_sock, (char *)g_pkts[got], (int)PKT_CAP, 0);
+    int n = (int)recv(g_rx_sock, (char *)g_pkts[got], (int)PKT_CAP, 0);
     if (n > 0) {
       g_pkt_lens[got++] = n;
     } else {
-      Sleep(0);
+      zc_yield();
     }
   }
   CHECK(got == expected);
@@ -245,12 +275,14 @@ static void test_slice_does_not_clobber_frame(zc_video_tx_t *tx, zc_video_rx_t *
 }
 
 int main(void) {
+#ifdef _WIN32
   WSADATA wsa;
   CHECK(WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
+#endif
 
   g_rx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   g_tx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-  CHECK(g_rx_sock != INVALID_SOCKET && g_tx_sock != INVALID_SOCKET);
+  CHECK(g_rx_sock != ZC_INVALID_SOCK && g_tx_sock != ZC_INVALID_SOCK);
   int rcvbuf = 1024 * 1024;
   setsockopt(g_rx_sock, SOL_SOCKET, SO_RCVBUF, (const char *)&rcvbuf, sizeof(rcvbuf));
 
@@ -260,8 +292,13 @@ int main(void) {
   CHECK(bind(g_rx_sock, (struct sockaddr *)&g_addr, sizeof(g_addr)) == 0);
   g_addr_len = sizeof(g_addr);
   CHECK(getsockname(g_rx_sock, (struct sockaddr *)&g_addr, &g_addr_len) == 0);
+#ifdef _WIN32
   u_long nonblock = 1;
   ioctlsocket(g_rx_sock, FIONBIO, &nonblock);
+#else
+  int flags = fcntl(g_rx_sock, F_GETFL, 0);
+  CHECK(flags >= 0 && fcntl(g_rx_sock, F_SETFL, flags | O_NONBLOCK) == 0);
+#endif
 
   zc_video_tx_t *tx = (zc_video_tx_t *)calloc(1, sizeof(*tx));
   zc_video_rx_t *rx = (zc_video_rx_t *)calloc(1, sizeof(*rx));
@@ -279,9 +316,11 @@ int main(void) {
   zc_video_tx_destroy(tx);
   free(rx);
   free(tx);
-  closesocket(g_rx_sock);
-  closesocket(g_tx_sock);
+  zc_close_sock(g_rx_sock);
+  zc_close_sock(g_tx_sock);
+#ifdef _WIN32
   WSACleanup();
+#endif
   printf("=== ALL VIDEO BRIDGE TESTS PASSED ===\n");
   return 0;
 }

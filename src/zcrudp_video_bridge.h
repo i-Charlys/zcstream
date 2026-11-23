@@ -279,7 +279,7 @@ int zc_video_rx_feed(zc_video_rx_t *rx, const uint8_t *pkt, size_t pkt_len,
 
 /**
  * Like zc_video_rx_feed, but delivers single-datagram (total_frags==1, parity==0)
- * independent ternary slices immediately even if reordered within a frame.
+ * independent zcvid slices immediately even if reordered within a frame.
  * Such slices bypass frame tracking, so duplicated datagrams are delivered
  * twice: the caller deduplicates if its payload is not idempotent.
  * On return 1, *out_data points at the payload (a slice buffer or frame_buf),
@@ -291,11 +291,11 @@ int zc_video_rx_feed_slice(zc_video_rx_t *rx, const uint8_t *pkt, size_t pkt_len
                            bool *out_fec_used);
 
 /**
- * Routes a ternary video packet via zcrudp_ternary_route_packet:
- *  - ZCRUDP_TERNARY_CHAN_RELIABLE_FEC -> FEC-protected zcrudp TX (INTRA / TILE_MV)
- *  - ZCRUDP_TERNARY_CHAN_UNRELIABLE_RIO -> direct Winsock RIO / unreliable TX (DELTA / DELTA_2X)
+ * Routes a zcvid video packet via zcrudp_zcvid_route_packet:
+ *  - ZCRUDP_ZCVID_CHAN_RELIABLE_FEC -> FEC-protected zcrudp TX (INTRA / TILE_MV)
+ *  - ZCRUDP_ZCVID_CHAN_UNRELIABLE_RIO -> direct Winsock RIO / unreliable TX (DELTA / DELTA_2X)
  */
-int zc_video_tx_send_ternary_packet(zc_video_tx_t *tx, uintptr_t udp_sock,
+int zc_video_tx_send_zcvid_packet(zc_video_tx_t *tx, uintptr_t udp_sock,
                                     const void *dst_addr, int dst_addr_len,
                                     uint32_t pkt_seq_id, const uint8_t *pkt,
                                     size_t pkt_len, uint64_t now_us,

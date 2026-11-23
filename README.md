@@ -13,7 +13,7 @@ Ultra-low-latency GPU video streaming prototypes built on top of [`zcrudp::nextg
 
 Under simulated degraded network (`--nasty`: 5% random loss + 8% 3-pkt bursts + 15% reordering + 5% duplicates + 2–5 ms OWD/jitter), Cauchy $\mathrm{GF}(2^8)$ FEC (`--fec 3`) runs in **32 µs p50 TX** and recovers frames in 0-RTT.
 
-## Ternary HLSL pipeline (`zcrudp_ternary_bench.exe`)
+## Zcvid HLSL pipeline (`zcrudp_zcvid_bench.exe`)
 
 Third prototype: the [`zcvid`](../zcvid) compute shaders (`cs_5_0`)
 encode and decode YCbCr in VRAM with per-tile motion vectors. Motion vectors
@@ -32,9 +32,9 @@ kept with black bars; capture restarts by itself after a mode switch.
 
 ### Bitstream
 
-The shaders emit 8-byte records. `gpu_pipeline_ternary_set_packed` repacks
-them losslessly (sorted, gap-coded), and `gpu_pipeline_ternary_set_entropy`
-adds an adaptive range coder on top (the one in `zcvid/include/ternary_entropy.h`):
+The shaders emit 8-byte records. `gpu_pipeline_zcvid_set_packed` repacks
+them losslessly (sorted, gap-coded), and `gpu_pipeline_zcvid_set_entropy`
+adds an adaptive range coder on top (the one in `zcvid/include/zcvid_entropy.h`):
 trits are coded under the context of their left and upper neighbours, intra
 samples as the error of a left/up/up-left prediction. Still lossless, and the
 rate control spends the saving on more records. Measured on a 1920x1080 game
@@ -68,7 +68,7 @@ carries the receiver's own decoding budget, which the sender never exceeds.
 
 ### Motion: quarter pel and transform intra
 
-Tile vectors can be in quarter pels (`gpu_pipeline_ternary_set_qpel`). The
+Tile vectors can be in quarter pels (`gpu_pipeline_zcvid_set_qpel`). The
 reference is then interpolated with a separable 4-tap filter (the HEVC chroma
 taps), in integers on both sides so encoder and decoder stay bit-exact on any
 GPU. Bilinear interpolation was tried first: its blur builds up frame after
@@ -77,15 +77,15 @@ The motion search refines its whole-pel winner to the half pel, then the
 quarter pel.
 
 Blocks that need intra (disocclusion) can be coded with the 4x4 integer
-transform of H.264 instead of raw samples (`gpu_pipeline_ternary_set_transform`,
+transform of H.264 instead of raw samples (`gpu_pipeline_zcvid_set_transform`,
 `CSIntraT` / `CSITrans`). Rolling refresh keeps the exact sample intra: making
 it lossy costs more than it saves.
 
 The same transform also codes the residual against the motion prediction
-(`gpu_pipeline_ternary_set_transform_inter`): a hybrid mode where any 4x4
+(`gpu_pipeline_zcvid_set_transform_inter`): a hybrid mode where any 4x4
 block whose coded residual brings it clearly closer to the source (by a
 quarter of its error at least) is transform-coded, at a qp that follows the
-rate control, and the ternary deltas refine everything else. Blocks where
+rate control, and the zcvid deltas refine everything else. Blocks where
 the transform would not help (too coarse a qp) are left to the deltas, so
 none can get stuck on a bad prediction.
 
@@ -121,7 +121,7 @@ measured against the source in luma. NVENC's decoded luma plane is compared
 with the source converted the way NVENC converts it (fitted on a 300 Mbps
 still: BT.709 limited range, 61.5 dB at 300 Mbps), in full-scale units:
 
-| Motion | NVENC H.264 P1 | NVENC P7 | Ternary (default) |
+| Motion | NVENC H.264 P1 | NVENC P7 | Zcvid (default) |
 | :--- | :--- | :--- | :--- |
 | pan (2.5, 1.25) px/frame | 36.3 dB (min 27.3) | 37.0 dB | 33.5 dB (min 30.6) |
 | pan (0.3, 4.6) px/frame | 36.8 dB | 37.5 dB | 33.2 dB |
@@ -131,12 +131,12 @@ still: BT.709 limited range, 61.5 dB at 300 Mbps), in full-scale units:
 | still | 46.2 dB at 20 Mbps | 46.3 dB | 49.1 dB at 1.3 Mbps |
 
 H.264 stays 2.9 to 4.3 dB ahead on camera motion (the vertical pan is not
-comparable: NVENC overshoots its rate by a quarter). The ternary codec wins
+comparable: NVENC overshoots its rate by a quarter). The zcvid codec wins
 on whole-pel motion and still pictures, never dips (every NVENC IDR frame
 falls to about 27.5 dB), and codes chroma at full resolution where H.264 has
 4:2:0. Coarser chroma in the transform (qp + 15 instead of + 3) lifts the
 vertical pan to 46.4 dB luma but costs 2 to 6 dB of chroma elsewhere, so it
-is not the default. Coding every residual with the transform and no ternary
+is not the default. Coding every residual with the transform and no zcvid
 deltas at all was tried too: 0.1 to 0.8 dB worse than the hybrid. Transform
 coefficients are range-coded block by block (gap to the previous coded
 block in blocks, per-plane presence, qp and count, zigzag steps and levels
@@ -204,7 +204,7 @@ drop its own datagrams to try it. 1200 frames at 120 fps over loopback,
 | `--sim-loss 5` (5 % of datagrams) | 0 | 0 |
 | `--sim-loss 5 --sim-burst 8 3` (about 31 %) | 0 | 0 |
 
-`zcrudp_ternary_bench` under impairment sends the records as small
+`zcrudp_zcvid_bench` under impairment sends the records as small
 FEC-protected slices and sends again whatever is still missing, 8 times at
 most (`--resend N`, 0 to disable). A resend does not wait for datagrams the
 link merely delayed: past the ordinary transit time the missing slices go out
@@ -238,7 +238,7 @@ it used to address pixels and wrapped past 4.19 Mpx (11.0 dB at 4K).
 - **Shader cache.** Compiled shaders are kept in
   `%LOCALAPPDATA%\zcrudp\shaders`, keyed by a hash of the source, entry point,
   profile and flags. The first start after a shader change compiles (about
-  2.5 s); later starts load the bytecode in about 4 ms. Creating the ternary
+  2.5 s); later starts load the bytecode in about 4 ms. Creating the zcvid
   pipeline then takes about 190 ms, 145 of them in `D3D11CreateDevice`.
 - **Adaptive FEC.** `zcrudp_stream` sends no parity while the receiver reports
   no loss; the first retransmission request or resync turns the `--fec`
@@ -272,13 +272,13 @@ it used to address pixels and wrapped past 4.19 Mpx (11.0 dB at 4K).
 - **Display deblocking.** `CSYCbCrToRGBA` smooths luma steps of at most 6
   across 4x4 block edges, after the closed loop (no drift possible). Effect
   on PSNR: 0 to +0.08 dB.
-- **Dither** (`gpu_pipeline_ternary_set_dither`, off by default): ordered 4x4
+- **Dither** (`gpu_pipeline_zcvid_set_dither`, off by default): ordered 4x4
   dither on the 6-bit rolling refresh. Removes banding on gradients, costs
   about 2.6 dB of PSNR on the bench pattern.
 
 ### Motion bench
 
-`ternary_motion_bench` (built with the rest, needs a D3D11 GPU) moves a
+`zcvid_motion_bench` (built with the rest, needs a D3D11 GPU) moves a
 picture through the encoder and decoder without the network: whole-pixel and
 sub-pixel pans, zoom, PSNR, bitrate, timings, reference mismatch and decoder
 fuzzing. Its header lists the options; the codec settings `zcrudp_stream`
@@ -286,10 +286,10 @@ uses are `PACK=1 EC=1 QPEL=1 TQ=1 TQI=1`:
 
 ```powershell
 $env:PACK=1; $env:EC=1; $env:QPEL=1; $env:TQ=1; $env:TQI=1; $env:FPAN="2.5,1.25"
-.\build\ternary_motion_bench.exe - 0 0 25    # generated picture, 25 Mbps
+.\build\zcvid_motion_bench.exe - 0 0 25    # generated picture, 25 Mbps
 ```
 
-The ternary bench's simulated losses have no resync: a slice lost beyond
+The zcvid bench's simulated losses have no resync: a slice lost beyond
 the resends leaves the last frame a few pixels off the encoder (seen once,
 17 pixels, under `--nasty`). `zcrudp_stream` resyncs and lost no frame in
 the same conditions.
@@ -305,7 +305,7 @@ All three benchmarks accept `--frames N`, `--width W`, `--height H`,
 | :--- | :--- |
 | `zcrudp_stream_bench` | `--bitrate BPS`, `--no-fec`, `--live` (show the window) |
 | `zcrudp_pyrowave_bench` | `--target-bytes N` |
-| `zcrudp_ternary_bench` | `--psnr`, `--synth`, `--no-rio`, `--no-fec`, `--resend N`, `--no-qpel`, `--no-transform`, `--bitrate BPS`, `--live` |
+| `zcrudp_zcvid_bench` | `--psnr`, `--synth`, `--no-rio`, `--no-fec`, `--resend N`, `--no-qpel`, `--no-transform`, `--bitrate BPS`, `--live` |
 
 With `--fec N`, up to N lost fragments per frame are rebuilt from parity. A frame split in
 more than 239 fragments reuses coefficient columns, so two losses a multiple
@@ -315,14 +315,28 @@ Once Winsock RIO is enabled on a socket, every datagram (data, parity,
 delayed packets) goes through RIO: ordinary `WSASendTo` calls were observed
 to fail on the connected `WSA_FLAG_REGISTERED_IO` socket these benchmarks use.
 
-## Build (Windows, Clang + CMake)
+## Quick Install & Build (Zero-Config)
 
-1. Place `zcrudp` at `../zcrudp` and `zcvid` at `../zcvid`.
-2. Download `nvEncodeAPI.h` (from `FFmpeg/nv-codec-headers`) into `third_party/nvEncodeAPI.h`.
-3. Optional for `zcrudp_pyrowave_bench`: place `Themaister/pyrowave` (with `Granite`, `volk`, `Vulkan-Headers`) in `third_party/pyrowave-master` and build `libpyrowave.a`.
-4. Configure & build:
+You do **not** need to manually clone 5 repositories or edit hardcoded paths:
+
+### Option A — Full Suite One-Command Installer (Recommended)
+Run `install.ps1` (Windows) or `install.sh` (Linux/macOS) from either `zcstream` or `zcstream-app`. It automatically clones/updates `zcrudp`, `zcvid`, `zpsync`, `zcstream`, and `zcstream-app` side by side, detects your compiler (`clang`, `gcc`, or MSVC), downloads `nvEncodeAPI.h`, builds all binaries + GUI, runs the test suites, and stages a ready-to-run bundle in `../dist/`:
+
 ```powershell
-cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
-cmake --build build -j 8
-ctest --test-dir build   # fragment/FEC bridge tests, no GPU needed
+# Windows (PowerShell)
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+
+# Linux / macOS
+chmod +x ./install.sh && ./install.sh
 ```
+
+### Option B — Standalone CMake Build (Auto-Fetch Enabled)
+If you only cloned `zcstream`, CMake automatically downloads `zcrudp`, `zcvid`, `zpsync`, and `nvEncodeAPI.h` into `build/_deps/` when they are not present in `../` (disable with `-DZCSTREAM_AUTO_FETCH=OFF` or override paths with `-DZCRUDP_DIR=... -DZCVID_DIR=... -DZPSYNC_DIR=...`):
+
+```powershell
+cmake -S . -B build
+cmake --build build --config Release -j 8
+ctest --test-dir build --output-on-failure   # fragment/FEC bridge & portable pipeline tests, no GPU needed
+```
+
+*(Optional for `zcrudp_pyrowave_bench`: place `Themaister/pyrowave` in `third_party/pyrowave-master` and build `libpyrowave.a`.)*

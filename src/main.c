@@ -65,6 +65,10 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) num_frames = (size_t)atoi(argv[++i]);
     else if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) width = (uint32_t)atoi(argv[++i]);
     else if (strcmp(argv[i], "--height") == 0 && i + 1 < argc) height = (uint32_t)atoi(argv[++i]);
+    else if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
+      int v = atoi(argv[++i]);
+      fps = (v > 0) ? (uint32_t)v : 120U;
+    }
     else if (strcmp(argv[i], "--bitrate") == 0 && i + 1 < argc) bitrate_bps = (uint32_t)atoi(argv[++i]);
     else if (strcmp(argv[i], "--synth") == 0) gpu_pipeline_force_synth(NULL, true);
   }

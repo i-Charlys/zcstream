@@ -1,16 +1,87 @@
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <mmsystem.h>
+#else
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sched.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+#endif
 
 #include "gpu_pipeline_win32.h"
 #include "zcrudp_video_bridge.h"
-#include "ternary_zcrudp_bridge.h"
+#include "zcvid_zcrudp_bridge.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+typedef SOCKET zc_sock_t;
+typedef int zc_socklen_t;
+#define ZC_INVALID_SOCK INVALID_SOCKET
+#define zc_closesocket(s) closesocket(s)
+#define zc_sock_err() WSAGetLastError()
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+typedef HANDLE(WINAPI *pfn_av_set_mm_t)(LPCSTR, LPDWORD);
+typedef BOOL(WINAPI *pfn_av_revert_mm_t)(HANDLE);
+
+static HMODULE g_avrt_dll = NULL;
+static HANDLE g_mmcss_task = NULL;
+
+static void enable_low_latency_thread(void) {
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+  g_avrt_dll = LoadLibraryA("avrt.dll");
+  if (g_avrt_dll) {
+    pfn_av_set_mm_t fn = (pfn_av_set_mm_t)(void *)GetProcAddress(g_avrt_dll, "AvSetMmThreadCharacteristicsA");
+    if (fn) {
+      DWORD task_idx = 0;
+      g_mmcss_task = fn("Games", &task_idx);
+    }
+  }
+}
+
+static void disable_low_latency_thread(void) {
+  if (g_mmcss_task && g_avrt_dll) {
+    pfn_av_revert_mm_t fn = (pfn_av_revert_mm_t)(void *)GetProcAddress(g_avrt_dll, "AvRevertMmThreadCharacteristics");
+    if (fn) fn(g_mmcss_task);
+    g_mmcss_task = NULL;
+  }
+  if (g_avrt_dll) {
+    FreeLibrary(g_avrt_dll);
+    g_avrt_dll = NULL;
+  }
+}
+#else
+typedef int zc_sock_t;
+typedef socklen_t zc_socklen_t;
+#define ZC_INVALID_SOCK (-1)
+#define zc_closesocket(s) close(s)
+#define zc_sock_err() errno
+
+static void enable_low_latency_thread(void) {}
+static void disable_low_latency_thread(void) {}
+static void zc_sleep_us(uint64_t us) {
+  struct timespec ts;
+  ts.tv_sec = (time_t)(us / 1000000ULL);
+  ts.tv_nsec = (long)((us % 1000000ULL) * 1000ULL);
+  nanosleep(&ts, NULL);
+}
+#endif
 
 static int cmp_double(const void *a, const void *b) {
   double da = *(const double *)a;
@@ -44,6 +115,7 @@ int main(int argc, char **argv) {
   bool force_synth = false;
   bool use_qpel = true;
   bool use_transform = true;
+  bool raw_slices = false;
   uint32_t max_resend = 8;
   uint64_t resent_rounds = 0;
   zc_net_impair_t impair = {0};
@@ -52,10 +124,12 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "--live") == 0) show_window = true;
     else if (strcmp(argv[i], "--psnr") == 0) measure_psnr = true;
     else if (strcmp(argv[i], "--synth") == 0) force_synth = true;
+    else if (strcmp(argv[i], "--raw") == 0) raw_slices = true;
     else if (strcmp(argv[i], "--no-qpel") == 0) use_qpel = false;
     else if (strcmp(argv[i], "--no-transform") == 0) use_transform = false;
     else if (strcmp(argv[i], "--no-rio") == 0) enable_rio = false;
     else if (strcmp(argv[i], "--no-fec") == 0) fec_shards = 0;
+    else if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc) fps = (uint32_t)atoi(argv[++i]);
     else if (strcmp(argv[i], "--resend") == 0 && i + 1 < argc) max_resend = (uint32_t)atoi(argv[++i]);
     else if (strcmp(argv[i], "--fec") == 0 && i + 1 < argc) fec_shards = (uint8_t)atoi(argv[++i]);
     else if (strcmp(argv[i], "--loss") == 0 && i + 1 < argc) impair.loss_pct = atoi(argv[++i]);
@@ -82,32 +156,45 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[i], "--bitrate") == 0 && i + 1 < argc) bitrate_bps = (uint32_t)atoi(argv[++i]);
   }
 
+#ifdef _WIN32
   timeBeginPeriod(1);
+#endif
+  enable_low_latency_thread();
+#ifdef _WIN32
+  HANDLE pace_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                             TIMER_ALL_ACCESS);
 
   WSADATA wsa;
   if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
     fprintf(stderr, "WSAStartup failed\n");
     return 1;
   }
+#endif
 
   bool has_impair = (impair.loss_pct > 0 || impair.burst_prob_pct > 0 ||
                      impair.reorder_pct > 0 || impair.dup_pct > 0 ||
                      impair.base_owd_us > 0 || impair.jitter_us > 0);
   /* The bridge routes every datagram (FEC and delayed packets included)
    * through RIO once enabled, so RIO also works under simulated impairment. */
+#ifdef _WIN32
   bool want_rio = enable_rio;
-
-  SOCKET rx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-  SOCKET tx_sock = want_rio
+  zc_sock_t rx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  zc_sock_t tx_sock = want_rio
       ? WSASocketA(AF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, 0,
                    WSA_FLAG_REGISTERED_IO | WSA_FLAG_OVERLAPPED)
       : socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-  if (tx_sock == INVALID_SOCKET) {
+  if (tx_sock == ZC_INVALID_SOCK) {
     want_rio = false;
     tx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   }
-  if (rx_sock == INVALID_SOCKET || tx_sock == INVALID_SOCKET) {
-    fprintf(stderr, "socket failed: %d\n", WSAGetLastError());
+#else
+  (void)enable_rio;
+  bool want_rio = false;
+  zc_sock_t rx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  zc_sock_t tx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+#endif
+  if (rx_sock == ZC_INVALID_SOCK || tx_sock == ZC_INVALID_SOCK) {
+    fprintf(stderr, "socket failed: %d\n", zc_sock_err());
     return 1;
   }
 
@@ -124,26 +211,34 @@ int main(int argc, char **argv) {
     fprintf(stderr, "bind failed\n");
     return 1;
   }
-  int addr_len = sizeof(bind_addr);
+  zc_socklen_t addr_len = (zc_socklen_t)sizeof(bind_addr);
   getsockname(rx_sock, (struct sockaddr *)&bind_addr, &addr_len);
 
+#ifdef _WIN32
   u_long nonblock = 1;
   ioctlsocket(rx_sock, FIONBIO, &nonblock);
+#else
+  fcntl(rx_sock, F_SETFL, fcntl(rx_sock, F_GETFL, 0) | O_NONBLOCK);
+#endif
 
   gpu_pipeline_t *gpu = NULL;
   gpu_pipeline_info_t info;
-  int rc = gpu_pipeline_create_ternary(&gpu, width, height, fps,
+  int rc = gpu_pipeline_create_zcvid(&gpu, width, height, fps,
                                        6U, 4U, 256U, 128U,
                                        show_window, &info);
   if (rc != 0) {
-    fprintf(stderr, "gpu_pipeline_create_ternary failed: %d\n", rc);
+    fprintf(stderr, "gpu_pipeline_create_zcvid failed: %d\n", rc);
     return 1;
   }
   gpu_pipeline_set_bitrate(gpu, bitrate_bps);
   if (force_synth) gpu_pipeline_force_synth(gpu, true);
-  gpu_pipeline_ternary_set_qpel(gpu, use_qpel);
-  gpu_pipeline_ternary_set_transform(gpu, use_transform);
-  gpu_pipeline_ternary_set_transform_inter(gpu, use_transform);
+  if (raw_slices) {
+    gpu_pipeline_zcvid_set_packed(gpu, false);
+    gpu_pipeline_zcvid_set_entropy(gpu, false);
+  }
+  gpu_pipeline_zcvid_set_qpel(gpu, use_qpel);
+  gpu_pipeline_zcvid_set_transform(gpu, use_transform);
+  gpu_pipeline_zcvid_set_transform_inter(gpu, use_transform);
 
   zc_video_tx_t *tx = (zc_video_tx_t *)calloc(1, sizeof(*tx));
   zc_video_rx_t *rx = (zc_video_rx_t *)calloc(1, sizeof(*rx));
@@ -156,11 +251,15 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  /* The vectors and the records of a video frame travel as two transport
-   * frames that may complete in either order: take both. Datagrams of other
-   * video frames are filtered below on the ternary header. */
-  rx->allow_out_of_order = true;
+  /* In --raw mode, vectors and records travel as two transport frames that may
+   * complete in either order. In unified mode, enable TX history for NACK
+   * recovery under simulated packet loss. */
+  rx->allow_out_of_order = raw_slices;
+  if (!raw_slices && has_impair) {
+    zc_video_tx_enable_history(tx, 16U);
+  }
 
+#ifdef _WIN32
   if (want_rio) {
     /* A socket created with WSA_FLAG_REGISTERED_IO is only driven through
      * RIO here: if RIO setup fails, fall back to an ordinary socket. */
@@ -179,8 +278,11 @@ int main(int argc, char **argv) {
       setsockopt(tx_sock, SOL_SOCKET, SO_SNDBUF, (const char *)&rcvbuf, sizeof(rcvbuf));
     }
   }
+#else
+  (void)want_rio;
+#endif
 
-  printf("=== zcrudp::nextgen + Ternary HLSL Compute (cs_5_0) Zero-Copy Pipeline ===\n");
+  printf("=== zcrudp::nextgen + Zcvid HLSL Compute (cs_5_0) Zero-Copy Pipeline ===\n");
   printf("GPU Adapter   : %s\n", info.adapter_name);
   printf("Video Codec   : %s | RIO=%s\n", info.encoder_name,
          tx->rio_ready ? "ON" : "OFF");
@@ -199,7 +301,7 @@ int main(int argc, char **argv) {
   double *tot_arr = (double *)calloc(num_frames, sizeof(double));
   double *psnr_arr = measure_psnr ? (double *)calloc(num_frames, sizeof(double)) : NULL;
 
-  size_t wire_cap = ZCRUDP_TERNARY_PKT_HDR_SZ + 20U * 1024U * 1024U;
+  size_t wire_cap = ZCRUDP_ZCVID_PKT_HDR_SZ + 20U * 1024U * 1024U;
   uint8_t *wire_buf = (uint8_t *)malloc(wire_cap);
   uint8_t *rx_frame_buf = (uint8_t *)malloc(wire_cap); /* frame as received */
   uint8_t rx_pkt[2048];
@@ -233,8 +335,22 @@ int main(int argc, char **argv) {
     {
       uint64_t now = qpc_now_us();
       if (now < next_frame_us) {
-        if (next_frame_us - now > 1500U) Sleep((DWORD)((next_frame_us - now - 1000U) / 1000U));
+        uint64_t rem = next_frame_us - now;
+#ifdef _WIN32
+        if (pace_timer && rem > 600ULL) {
+          LARGE_INTEGER due;
+          due.QuadPart = -(LONGLONG)((rem - 350ULL) * 10ULL);
+          if (SetWaitableTimer(pace_timer, &due, 0, NULL, NULL, FALSE)) {
+            WaitForSingleObject(pace_timer, INFINITE);
+          }
+        } else if (rem > 1500ULL) {
+          Sleep((DWORD)((rem - 1000ULL) / 1000ULL));
+        }
         while (qpc_now_us() < next_frame_us) YieldProcessor();
+#else
+        if (rem > 500ULL) zc_sleep_us(rem - 300ULL);
+        while (qpc_now_us() < next_frame_us) sched_yield();
+#endif
       }
       next_frame_us += frame_period_us;
       now = qpc_now_us();
@@ -254,13 +370,112 @@ int main(int argc, char **argv) {
 
     if (f >= warmup) sent_frames++;
 
-    /* bs layout: [uint32 record_words][uint32 mv_bytes][mvs][records] */
+    if (!raw_slices) {
+      /* Unified packed + entropy-coded transport (matching zcrudp_stream). */
+      const uint64_t wire_bytes_before = tx->bytes_sent;
+      uint64_t t_tx0 = qpc_now_us();
+      zc_video_tx_send_frame(tx, (uintptr_t)tx_sock, &bind_addr, addr_len,
+                             f, bs, bs_len, keyframe, t_tx0, has_impair);
+      uint64_t tx_us = qpc_now_us() - t_tx0;
+
+      uint64_t t_rx0 = qpc_now_us();
+      uint64_t idle_grace_us = (uint64_t)impair.base_owd_us + (uint64_t)impair.jitter_us + 2500ULL;
+      uint64_t wait_deadline = t_rx0 + (has_impair ? (idle_grace_us * (max_resend + 2U) + 20000ULL) : 10000ULL);
+      uint64_t last_rx_us = t_rx0;
+      uint32_t resends = 0U;
+      bool got_frame = false;
+      size_t rx_len = 0;
+      uint32_t rx_fid = 0;
+      bool rx_kf = false, rx_fec = false;
+      while (qpc_now_us() < wait_deadline) {
+        uint64_t now = qpc_now_us();
+        if (has_impair) {
+          zc_video_tx_flush_net(tx, (uintptr_t)tx_sock, &bind_addr, addr_len, now);
+        }
+        int n = recv(rx_sock, (char *)rx_pkt, sizeof(rx_pkt), 0);
+        if (n > 0) {
+          last_rx_us = now;
+          if (zc_video_rx_feed(rx, rx_pkt, (size_t)n, &rx_len, &rx_fid, &rx_kf, &rx_fec) == 1 &&
+              rx_fid == f) {
+            got_frame = true;
+            break;
+          }
+        } else {
+          if (has_impair && max_resend > 0U && resends < max_resend &&
+              (now - last_rx_us) >= idle_grace_us) {
+            uint16_t missing[ZC_NACK_MAX_FRAGS];
+            uint16_t mcnt = 0U;
+            bool found_slot = false;
+            for (uint32_t si = 0; si < ZC_RX_SLOTS; ++si) {
+              const zc_video_rx_slot_t *sl = &rx->slots[si];
+              if (sl->used && sl->frame_id == f && !sl->complete) {
+                found_slot = true;
+                for (uint16_t k = 0; k < sl->total_frags && mcnt < ZC_NACK_MAX_FRAGS; ++k) {
+                  if (!sl->frag_present[k]) missing[mcnt++] = k;
+                }
+                break;
+              }
+            }
+            uint64_t rt0 = qpc_now_us();
+            if (found_slot && mcnt > 0U) {
+              zc_video_tx_resend(tx, (uintptr_t)tx_sock, &bind_addr, addr_len,
+                                 f, missing, mcnt, rt0, true);
+            } else {
+              zc_video_tx_resend(tx, (uintptr_t)tx_sock, &bind_addr, addr_len,
+                                 f, NULL, 0U, rt0, true);
+            }
+            resends++;
+            if (f >= warmup) resent_rounds++;
+            last_rx_us = qpc_now_us();
+          } else {
+#ifdef _WIN32
+            Sleep(0);
+#else
+            sched_yield();
+#endif
+          }
+        }
+      }
+      uint64_t rx_us = qpc_now_us() - t_rx0;
+      gpu_pipeline_set_bitrate(gpu, zc_rate_budget_update(&rate_budget, tx, bs_len));
+      if (tx->bytes_sent > wire_bytes_before && got_frame && resends == 0U) {
+        uint64_t owd_us = rx_us ? rx_us : 1ULL;
+        zc_video_tx_on_ack(tx, (uint32_t)owd_us,
+                           (uint32_t)(tx->bytes_sent - wire_bytes_before), 0U);
+      }
+      if (got_frame) {
+        double dec_us = 0, prs_us = 0;
+        int drc = gpu_pipeline_decode_and_present(gpu, rx->frame_buf, rx_len, &dec_us, &prs_us);
+        if (drc == 0 && f >= warmup && measured < num_frames) {
+          cap_arr[measured] = cap_us;
+          enc_arr[measured] = enc_us;
+          ntx_arr[measured] = (double)tx_us;
+          nrx_arr[measured] = (double)rx_us;
+          dec_arr[measured] = dec_us;
+          prs_arr[measured] = prs_us;
+          tot_arr[measured] = cap_us + enc_us + ntx_arr[measured] +
+                              nrx_arr[measured] + dec_us + prs_us;
+          if (measure_psnr && psnr_arr) {
+            double pdb = 0.0;
+            if (gpu_pipeline_zcvid_compute_psnr(gpu, &pdb) == 0) psnr_arr[measured] = pdb;
+          }
+          total_bytes += (size_t)(tx->bytes_sent - wire_bytes_before);
+          measured++;
+        }
+      } else if (has_impair) {
+        rx->frames_dropped++;
+        gpu_pipeline_zcvid_request_keyframe(gpu);
+      }
+      continue;
+    }
+
+    /* Legacy --raw mode: bs layout: [uint32 record_words][uint32 mv_bytes][mvs][records] */
     uint32_t record_words = 0, mv_bytes = 0;
     memcpy(&record_words, bs, sizeof(uint32_t));
     if (bs_len < 8U) continue;
     memcpy(&mv_bytes, bs + sizeof(uint32_t), sizeof(uint32_t));
     if ((size_t)mv_bytes + (size_t)record_words * sizeof(uint32_t) > bs_len - 8U ||
-        ZCRUDP_TERNARY_PKT_HDR_SZ + (size_t)mv_bytes > wire_cap) {
+        ZCRUDP_ZCVID_PKT_HDR_SZ + (size_t)mv_bytes > wire_cap) {
       continue;
     }
     const uint8_t *mv_ptr = bs + 8U;
@@ -284,7 +499,7 @@ int main(int argc, char **argv) {
      * long slices while few are hit, short ones when many are. */
     /* Whole records (2 words) only: slices are appended in arrival order. */
     const uint32_t fec_words =
-        (slice_frags * (ZC_FRAG_MTU / 4U) - (ZCRUDP_TERNARY_PKT_HDR_SZ + 3U) / 4U) & ~1U;
+        (slice_frags * (ZC_FRAG_MTU / 4U) - (ZCRUDP_ZCVID_PKT_HDR_SZ + 3U) / 4U) & ~1U;
     const bool use_fec_frame =
         (has_impair && fec_shards > 0 &&
          (in_order || record_words / fec_words < (ZC_RX_SLOTS * 3U) / 4U));
@@ -320,20 +535,20 @@ int main(int argc, char **argv) {
 
     /* 1) Send Tile MVs on RELIABLE_FEC channel */
     if (!got_mv) {
-      zcrudp_ternary_pkt_hdr_t mvhdr = {
-          .magic = ZCRUDP_TERNARY_PKT_MAGIC,
-          .pixfmt = ZCRUDP_TERNARY_MAKE_PF(ZCRUDP_TERNARY_FMT_GRAY8,
-                                           ZCRUDP_TERNARY_PKT_TILE_MV),
+      zcrudp_zcvid_pkt_hdr_t mvhdr = {
+          .magic = ZCRUDP_ZCVID_PKT_MAGIC,
+          .pixfmt = ZCRUDP_ZCVID_MAKE_PF(ZCRUDP_ZCVID_FMT_GRAY8,
+                                           ZCRUDP_ZCVID_PKT_TILE_MV),
           .plane = 0,
           .frame_id = (uint16_t)(f & 0xFFFFU),
           .start_block = num_slices,
           .num_tokens = (uint16_t)(mv_bytes / 8U)
       };
-      zcrudp_ternary_pkt_hdr_write_le(wire_buf, &mvhdr);
-      memcpy(wire_buf + ZCRUDP_TERNARY_PKT_HDR_SZ, mv_ptr, mv_bytes);
-      size_t mv_wire_len = ZCRUDP_TERNARY_PKT_HDR_SZ + mv_bytes;
+      zcrudp_zcvid_pkt_hdr_write_le(wire_buf, &mvhdr);
+      memcpy(wire_buf + ZCRUDP_ZCVID_PKT_HDR_SZ, mv_ptr, mv_bytes);
+      size_t mv_wire_len = ZCRUDP_ZCVID_PKT_HDR_SZ + mv_bytes;
       frame_wire_bytes += mv_wire_len;
-      zc_video_tx_send_ternary_packet(tx, (uintptr_t)tx_sock, &bind_addr, addr_len,
+      zc_video_tx_send_zcvid_packet(tx, (uintptr_t)tx_sock, &bind_addr, addr_len,
                                       f * 2048U, wire_buf, mv_wire_len, t_tx0, has_impair);
     }
 
@@ -344,22 +559,22 @@ int main(int argc, char **argv) {
       uint32_t wcnt = record_words - off;
       if (wcnt > max_words_per_pkt) wcnt = max_words_per_pkt;
 
-      zcrudp_ternary_pkt_hdr_t dhdr = {
-          .magic = ZCRUDP_TERNARY_PKT_MAGIC,
-          .pixfmt = ZCRUDP_TERNARY_MAKE_PF(ZCRUDP_TERNARY_FMT_GRAY8,
-                                           use_fec_frame ? ZCRUDP_TERNARY_PKT_INTRA
-                                                         : ZCRUDP_TERNARY_PKT_DELTA),
+      zcrudp_zcvid_pkt_hdr_t dhdr = {
+          .magic = ZCRUDP_ZCVID_PKT_MAGIC,
+          .pixfmt = ZCRUDP_ZCVID_MAKE_PF(ZCRUDP_ZCVID_FMT_GRAY8,
+                                           use_fec_frame ? ZCRUDP_ZCVID_PKT_INTRA
+                                                         : ZCRUDP_ZCVID_PKT_DELTA),
           .plane = (uint8_t)(s + 1U == num_slices ? 1U : 0U),
           .frame_id = (uint16_t)(f & 0xFFFFU),
           .start_block = s,
           .num_tokens = (uint16_t)(wcnt > 0xFFFFU ? 0xFFFFU : wcnt) /* informative */
       };
-      zcrudp_ternary_pkt_hdr_write_le(wire_buf, &dhdr);
-      memcpy(wire_buf + ZCRUDP_TERNARY_PKT_HDR_SZ, rec_ptr + (size_t)off * sizeof(uint32_t),
+      zcrudp_zcvid_pkt_hdr_write_le(wire_buf, &dhdr);
+      memcpy(wire_buf + ZCRUDP_ZCVID_PKT_HDR_SZ, rec_ptr + (size_t)off * sizeof(uint32_t),
              (size_t)wcnt * sizeof(uint32_t));
-      size_t d_wire_len = ZCRUDP_TERNARY_PKT_HDR_SZ + (size_t)wcnt * sizeof(uint32_t);
+      size_t d_wire_len = ZCRUDP_ZCVID_PKT_HDR_SZ + (size_t)wcnt * sizeof(uint32_t);
       frame_wire_bytes += d_wire_len;
-      zc_video_tx_send_ternary_packet(tx, (uintptr_t)tx_sock, &bind_addr, addr_len,
+      zc_video_tx_send_zcvid_packet(tx, (uintptr_t)tx_sock, &bind_addr, addr_len,
                                       f * 2048U + 1U + s, wire_buf, d_wire_len, t_tx0, has_impair);
     }
     uint64_t t_tx1 = qpc_now_us();
@@ -400,28 +615,28 @@ int main(int argc, char **argv) {
         bool rx_kf = false, rx_fec = false;
         int frc = zc_video_rx_feed_slice(rx, rx_pkt, (size_t)n, &rx_data, &rx_len,
                                          &rx_fid, &rx_kf, &rx_fec);
-        if (frc == 1 && rx_len >= ZCRUDP_TERNARY_PKT_HDR_SZ) {
-          zcrudp_ternary_pkt_hdr_t rhdr;
-          if (zcrudp_ternary_pkt_hdr_read_le(rx_data, &rhdr) &&
+        if (frc == 1 && rx_len >= ZCRUDP_ZCVID_PKT_HDR_SZ) {
+          zcrudp_zcvid_pkt_hdr_t rhdr;
+          if (zcrudp_zcvid_pkt_hdr_read_le(rx_data, &rhdr) &&
               rhdr.frame_id == (uint16_t)(f & 0xFFFFU)) {
-            uint8_t ptype = ZCRUDP_TERNARY_HDR_TYPE(&rhdr);
-            if (ptype == ZCRUDP_TERNARY_PKT_TILE_MV) {
-              rx_mv_bytes = (uint32_t)(rx_len - ZCRUDP_TERNARY_PKT_HDR_SZ);
+            uint8_t ptype = ZCRUDP_ZCVID_HDR_TYPE(&rhdr);
+            if (ptype == ZCRUDP_ZCVID_PKT_TILE_MV) {
+              rx_mv_bytes = (uint32_t)(rx_len - ZCRUDP_ZCVID_PKT_HDR_SZ);
               if (rx_mv_bytes == mv_bytes) {
-                memcpy(rx_dec_buf + 8U, rx_data + ZCRUDP_TERNARY_PKT_HDR_SZ, rx_mv_bytes);
+                memcpy(rx_dec_buf + 8U, rx_data + ZCRUDP_ZCVID_PKT_HDR_SZ, rx_mv_bytes);
                 got_mv = true;
               }
               expected_slices = rhdr.start_block;
-            } else if ((ptype == ZCRUDP_TERNARY_PKT_DELTA || ptype == ZCRUDP_TERNARY_PKT_INTRA) &&
+            } else if ((ptype == ZCRUDP_ZCVID_PKT_DELTA || ptype == ZCRUDP_ZCVID_PKT_INTRA) &&
                        rhdr.start_block < num_slices && !slice_seen[rhdr.start_block]) {
               /* Records carry their own position, so slices may be appended
                * in arrival order; a duplicated datagram is dropped here. */
               slice_seen[rhdr.start_block] = 1U;
-              uint32_t wbytes = (uint32_t)(rx_len - ZCRUDP_TERNARY_PKT_HDR_SZ);
+              uint32_t wbytes = (uint32_t)(rx_len - ZCRUDP_ZCVID_PKT_HDR_SZ);
               uint32_t wcnt = wbytes / (uint32_t)sizeof(uint32_t);
               if (8U + mv_bytes + (size_t)(rx_record_words + wcnt) * sizeof(uint32_t) <= wire_cap) {
                 memcpy(rx_rec_dst + (size_t)rx_record_words * sizeof(uint32_t),
-                       rx_data + ZCRUDP_TERNARY_PKT_HDR_SZ,
+                       rx_data + ZCRUDP_ZCVID_PKT_HDR_SZ,
                        (size_t)wcnt * sizeof(uint32_t));
                 rx_record_words += wcnt;
               }
@@ -435,7 +650,11 @@ int main(int argc, char **argv) {
       } else {
         if (got_mv && rx_slices >= expected_slices) break;
         if ((got_mv || rx_slices > 0) && (qpc_now_us() - last_rx_us) > idle_grace_us) break;
+#ifdef _WIN32
         Sleep(0);
+#else
+        sched_yield();
+#endif
       }
     }
     rx_us += qpc_now_us() - t_rx0;
@@ -496,7 +715,7 @@ int main(int argc, char **argv) {
                             nrx_arr[measured] + dec_us + prs_us;
         if (measure_psnr && psnr_arr) {
           double pdb = 0.0;
-          if (gpu_pipeline_ternary_compute_psnr(gpu, &pdb) == 0) {
+          if (gpu_pipeline_zcvid_compute_psnr(gpu, &pdb) == 0) {
             psnr_arr[measured] = pdb;
           }
         }
@@ -530,10 +749,10 @@ int main(int argc, char **argv) {
     printf("Avg bitrate    : %.2f Mbps (%.1f KB/frame)\n\n",
            avg_mbps, ((double)total_bytes / (double)measured) / 1024.0);
     print_stat_row("1. Capture GPU", cap_arr, measured);
-    print_stat_row("2. Ternary Enc", enc_arr, measured);
+    print_stat_row("2. Zcvid Enc", enc_arr, measured);
     print_stat_row("3. zcrudp TX", ntx_arr, measured);
     print_stat_row("4. zcrudp RX", nrx_arr, measured);
-    print_stat_row("5. Ternary Dec", dec_arr, measured);
+    print_stat_row("5. Zcvid Dec", dec_arr, measured);
     print_stat_row("6. Present", prs_arr, measured);
     print_stat_row("TOTAL (Cap->Pr)", tot_arr, measured);
 
@@ -544,7 +763,7 @@ int main(int argc, char **argv) {
       /* Closed-loop check: on a lossless link the encoder reference and the
        * decoder reconstruction must be bit-identical. */
       uint64_t mismatch_px = 0;
-      if (gpu_pipeline_ternary_ref_mismatch(gpu, &mismatch_px) == 0) {
+      if (gpu_pipeline_zcvid_ref_mismatch(gpu, &mismatch_px) == 0) {
         printf("  %-18s | %llu px differ (last frame)\n", "Enc/Dec reference",
                (unsigned long long)mismatch_px);
       }
@@ -568,9 +787,15 @@ int main(int argc, char **argv) {
   free(rx);
   free(tx);
   gpu_pipeline_destroy(gpu);
-  closesocket(rx_sock);
-  if (!had_rio) closesocket(tx_sock);
+  zc_closesocket(rx_sock);
+  if (!had_rio) zc_closesocket(tx_sock);
+#ifdef _WIN32
+  if (pace_timer) CloseHandle(pace_timer);
   WSACleanup();
+#endif
+  disable_low_latency_thread();
+#ifdef _WIN32
   timeEndPeriod(1);
+#endif
   return 0;
 }
