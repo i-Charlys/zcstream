@@ -72,6 +72,12 @@ jobs:
           ctest --test-dir build -C Release --output-on-failure
           cmake --install build --config Release --prefix dist
 
+      - name: Install Linux X11 development headers
+        if: startsWith(matrix.target, 'linux-')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libx11-dev
+
       - name: Configure, Build, Test & Stage (Linux)
         if: startsWith(matrix.target, 'linux-')
         run: |

@@ -25,6 +25,15 @@
 #include <windows.h>
 #else
 #include <time.h>
+#if defined(__linux__) && defined(__has_include)
+#if __has_include(<X11/Xlib.h>) && __has_include(<X11/Xutil.h>) && __has_include(<X11/keysym.h>)
+#define ZC_PORTABLE_HAVE_X11 1
+#include <dlfcn.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/keysym.h>
+#endif
+#endif
 #endif
 
 #include <limits.h>
@@ -1221,6 +1230,60 @@ struct gpu_pipeline_s {
   uint64_t hint_move_rects;
   uint64_t hint_moved_tiles;
   uint64_t hint_static_tiles;
+
+#ifdef ZC_PORTABLE_HAVE_X11
+  void *x11_lib;
+  Display *x11_dpy;
+  Window x11_win;
+  GC x11_gc;
+  Atom x11_wm_del;
+  XImage *x11_img;
+  uint32_t x11_win_w;
+  uint32_t x11_win_h;
+  int x11_depth;
+  Visual *x11_vis;
+  uint8_t *disp_rgba;
+  uint8_t *disp_bgrx;
+  bool x11_win_open;
+  bool x11_closed;
+
+  Display *x11_cap_dpy;
+  Window x11_cap_root;
+  uint32_t x11_cap_w;
+  uint32_t x11_cap_h;
+  bool x11_cap_ok;
+  bool x11_cap_failed;
+
+  Display *(*p_XOpenDisplay)(const char *);
+  int (*p_XCloseDisplay)(Display *);
+  int (*p_XDefaultScreen)(Display *);
+  Window (*p_XRootWindow)(Display *, int);
+  Visual *(*p_XDefaultVisual)(Display *, int);
+  int (*p_XDefaultDepth)(Display *, int);
+  GC (*p_XDefaultGC)(Display *, int);
+  Window (*p_XCreateSimpleWindow)(Display *, Window, int, int, unsigned int,
+                                  unsigned int, unsigned int, unsigned long,
+                                  unsigned long);
+  int (*p_XStoreName)(Display *, Window, const char *);
+  int (*p_XSelectInput)(Display *, Window, long);
+  Atom (*p_XInternAtom)(Display *, const char *, Bool);
+  Status (*p_XSetWMProtocols)(Display *, Window, Atom *, int);
+  int (*p_XMapWindow)(Display *, Window);
+  int (*p_XFlush)(Display *);
+  int (*p_XPending)(Display *);
+  int (*p_XNextEvent)(Display *, XEvent *);
+  XImage *(*p_XCreateImage)(Display *, Visual *, unsigned int, int, int,
+                            char *, unsigned int, unsigned int, int, int);
+  int (*p_XPutImage)(Display *, Drawable, GC, XImage *, int, int, int, int,
+                     unsigned int, unsigned int);
+  XImage *(*p_XGetImage)(Display *, Drawable, int, int, unsigned int,
+                         unsigned int, unsigned long, int);
+  Status (*p_XGetWindowAttributes)(Display *, Window, XWindowAttributes *);
+  int (*p_XDestroyWindow)(Display *, Window);
+  XErrorHandler (*p_XSetErrorHandler)(XErrorHandler);
+  int (*p_XSync)(Display *, Bool);
+  KeySym (*p_XLookupKeysym)(XKeyEvent *, int);
+#endif
 };
 
 static size_t port_pack_sorted(const uint32_t *rec, const uint64_t *a, uint32_t num,
@@ -1755,6 +1818,265 @@ static void port_log_err(const char *msg) {
   }
 }
 
+#ifdef ZC_PORTABLE_HAVE_X11
+static volatile int g_x11_err_flag = 0;
+
+static int port_x11_error_handler(Display *dpy, XErrorEvent *ev) {
+  (void)dpy;
+  (void)ev;
+  g_x11_err_flag = 1;
+  return 0;
+}
+
+#define ZC_X11_DLSYM(lib, dst, name)                                           \
+  do {                                                                         \
+    void *sym_ = dlsym((lib), (name));                                         \
+    if (!sym_) return false;                                                   \
+    memcpy(&(dst), &sym_, sizeof(dst));                                        \
+  } while (0)
+
+static bool port_x11_load(gpu_pipeline_t *p) {
+  if (p->x11_lib) return true;
+  void *lib = dlopen("libX11.so.6", RTLD_LAZY);
+  if (!lib) lib = dlopen("libX11.so", RTLD_LAZY);
+  if (!lib) return false;
+  p->x11_lib = lib;
+  ZC_X11_DLSYM(lib, p->p_XOpenDisplay, "XOpenDisplay");
+  ZC_X11_DLSYM(lib, p->p_XCloseDisplay, "XCloseDisplay");
+  ZC_X11_DLSYM(lib, p->p_XDefaultScreen, "XDefaultScreen");
+  ZC_X11_DLSYM(lib, p->p_XRootWindow, "XRootWindow");
+  ZC_X11_DLSYM(lib, p->p_XDefaultVisual, "XDefaultVisual");
+  ZC_X11_DLSYM(lib, p->p_XDefaultDepth, "XDefaultDepth");
+  ZC_X11_DLSYM(lib, p->p_XDefaultGC, "XDefaultGC");
+  ZC_X11_DLSYM(lib, p->p_XCreateSimpleWindow, "XCreateSimpleWindow");
+  ZC_X11_DLSYM(lib, p->p_XStoreName, "XStoreName");
+  ZC_X11_DLSYM(lib, p->p_XSelectInput, "XSelectInput");
+  ZC_X11_DLSYM(lib, p->p_XInternAtom, "XInternAtom");
+  ZC_X11_DLSYM(lib, p->p_XSetWMProtocols, "XSetWMProtocols");
+  ZC_X11_DLSYM(lib, p->p_XMapWindow, "XMapWindow");
+  ZC_X11_DLSYM(lib, p->p_XFlush, "XFlush");
+  ZC_X11_DLSYM(lib, p->p_XPending, "XPending");
+  ZC_X11_DLSYM(lib, p->p_XNextEvent, "XNextEvent");
+  ZC_X11_DLSYM(lib, p->p_XCreateImage, "XCreateImage");
+  ZC_X11_DLSYM(lib, p->p_XPutImage, "XPutImage");
+  ZC_X11_DLSYM(lib, p->p_XGetImage, "XGetImage");
+  ZC_X11_DLSYM(lib, p->p_XGetWindowAttributes, "XGetWindowAttributes");
+  ZC_X11_DLSYM(lib, p->p_XDestroyWindow, "XDestroyWindow");
+  ZC_X11_DLSYM(lib, p->p_XSetErrorHandler, "XSetErrorHandler");
+  ZC_X11_DLSYM(lib, p->p_XSync, "XSync");
+  ZC_X11_DLSYM(lib, p->p_XLookupKeysym, "XLookupKeysym");
+  return true;
+}
+
+static bool port_x11_alloc_image(gpu_pipeline_t *p, uint32_t win_w, uint32_t win_h) {
+  if (win_w < 64U) win_w = 64U;
+  if (win_h < 64U) win_h = 64U;
+  if (p->x11_img) {
+    p->x11_img->data = NULL;
+    XDestroyImage(p->x11_img);
+    p->x11_img = NULL;
+  }
+  free(p->disp_bgrx);
+  p->disp_bgrx = (uint8_t *)calloc((size_t)win_w * (size_t)win_h, 4U);
+  if (!p->disp_bgrx) return false;
+  p->x11_img = p->p_XCreateImage(p->x11_dpy, p->x11_vis, (unsigned int)p->x11_depth,
+                                 ZPixmap, 0, (char *)p->disp_bgrx, win_w, win_h, 32,
+                                 (int)(win_w * 4U));
+  if (!p->x11_img) {
+    free(p->disp_bgrx);
+    p->disp_bgrx = NULL;
+    return false;
+  }
+  p->x11_win_w = win_w;
+  p->x11_win_h = win_h;
+  return true;
+}
+
+static bool port_x11_open_window(gpu_pipeline_t *p) {
+  if (!port_x11_load(p)) return false;
+  Display *dpy = p->p_XOpenDisplay(NULL);
+  if (!dpy) return false;
+  int scr = p->p_XDefaultScreen(dpy);
+  int depth = p->p_XDefaultDepth(dpy, scr);
+  if (depth != 24 && depth != 32) {
+    p->p_XCloseDisplay(dpy);
+    return false;
+  }
+  Visual *vis = p->p_XDefaultVisual(dpy, scr);
+  Window root = p->p_XRootWindow(dpy, scr);
+  uint32_t win_w = p->width;
+  uint32_t win_h = p->height;
+  if (win_w > 1280U) {
+    win_h = (uint32_t)(((uint64_t)win_h * 1280ULL) / win_w);
+    win_w = 1280U;
+  }
+  if (win_h > 720U && win_w > 0U) {
+    win_w = (uint32_t)(((uint64_t)win_w * 720ULL) / win_h);
+    win_h = 720U;
+  }
+  if (win_w < 64U) win_w = 64U;
+  if (win_h < 64U) win_h = 64U;
+
+  p->disp_rgba = (uint8_t *)malloc((size_t)p->width * (size_t)p->height * 4U);
+  if (!p->disp_rgba) {
+    p->p_XCloseDisplay(dpy);
+    return false;
+  }
+
+  Window win = p->p_XCreateSimpleWindow(dpy, root, 0, 0, win_w, win_h, 0, 0, 0);
+  p->p_XStoreName(dpy, win, "zcstream — Zcvid Live Receiver");
+  p->p_XSelectInput(dpy, win, StructureNotifyMask | ExposureMask | KeyPressMask);
+  Atom wm_del = p->p_XInternAtom(dpy, "WM_DELETE_WINDOW", False);
+  p->p_XSetWMProtocols(dpy, win, &wm_del, 1);
+
+  p->x11_dpy = dpy;
+  p->x11_win = win;
+  p->x11_gc = p->p_XDefaultGC(dpy, scr);
+  p->x11_wm_del = wm_del;
+  p->x11_depth = depth;
+  p->x11_vis = vis;
+  if (!port_x11_alloc_image(p, win_w, win_h)) {
+    p->p_XDestroyWindow(dpy, win);
+    p->p_XCloseDisplay(dpy);
+    p->x11_dpy = NULL;
+    free(p->disp_rgba);
+    p->disp_rgba = NULL;
+    return false;
+  }
+
+  p->p_XMapWindow(dpy, win);
+  p->p_XFlush(dpy);
+  p->x11_win_open = true;
+  return true;
+}
+
+static void port_rgba_to_bgrx(const uint8_t *rgba, uint32_t sw, uint32_t sh,
+                              uint8_t *bgrx, uint32_t dw, uint32_t dh) {
+  if (sw == dw && sh == dh) {
+    size_t n = (size_t)dw * (size_t)dh;
+    for (size_t i = 0U; i < n; ++i) {
+      bgrx[i * 4U + 0U] = rgba[i * 4U + 2U];
+      bgrx[i * 4U + 1U] = rgba[i * 4U + 1U];
+      bgrx[i * 4U + 2U] = rgba[i * 4U + 0U];
+      bgrx[i * 4U + 3U] = 0xFFU;
+    }
+    return;
+  }
+  for (uint32_t dy = 0U; dy < dh; ++dy) {
+    uint32_t sy = (uint32_t)(((uint64_t)dy * sh) / dh);
+    const uint8_t *srow = rgba + (size_t)sy * sw * 4U;
+    uint8_t *drow = bgrx + (size_t)dy * dw * 4U;
+    for (uint32_t dx = 0U; dx < dw; ++dx) {
+      uint32_t sx = (uint32_t)(((uint64_t)dx * sw) / dw);
+      drow[dx * 4U + 0U] = srow[sx * 4U + 2U];
+      drow[dx * 4U + 1U] = srow[sx * 4U + 1U];
+      drow[dx * 4U + 2U] = srow[sx * 4U + 0U];
+      drow[dx * 4U + 3U] = 0xFFU;
+    }
+  }
+}
+
+static bool port_x11_open_capture(gpu_pipeline_t *p) {
+  if (!port_x11_load(p)) return false;
+  Display *dpy = p->p_XOpenDisplay(NULL);
+  if (!dpy) return false;
+  int scr = p->p_XDefaultScreen(dpy);
+  Window root = p->p_XRootWindow(dpy, scr);
+  XWindowAttributes attr;
+  memset(&attr, 0, sizeof(attr));
+  if (!p->p_XGetWindowAttributes(dpy, root, &attr) || attr.width < 16 || attr.height < 16) {
+    p->p_XCloseDisplay(dpy);
+    return false;
+  }
+  unsigned int probe_w = (attr.width > 16) ? 16U : (unsigned int)attr.width;
+  unsigned int probe_h = (attr.height > 16) ? 16U : (unsigned int)attr.height;
+  g_x11_err_flag = 0;
+  XErrorHandler prev_h = p->p_XSetErrorHandler(port_x11_error_handler);
+  XImage *probe = p->p_XGetImage(dpy, root, 0, 0, probe_w, probe_h, AllPlanes, ZPixmap);
+  p->p_XSync(dpy, False);
+  p->p_XSetErrorHandler(prev_h);
+  if (probe) XDestroyImage(probe);
+  if (!probe || g_x11_err_flag != 0) {
+    p->p_XCloseDisplay(dpy);
+    return false;
+  }
+  p->x11_cap_dpy = dpy;
+  p->x11_cap_root = root;
+  p->x11_cap_w = (uint32_t)attr.width;
+  p->x11_cap_h = (uint32_t)attr.height;
+  p->x11_cap_ok = true;
+  return true;
+}
+
+static bool port_x11_capture_yuv(gpu_pipeline_t *p) {
+  if (!p->x11_cap_ok || !p->x11_cap_dpy) return false;
+  g_x11_err_flag = 0;
+  XErrorHandler prev_h = p->p_XSetErrorHandler(port_x11_error_handler);
+  XImage *img = p->p_XGetImage(p->x11_cap_dpy, p->x11_cap_root, 0, 0,
+                               p->x11_cap_w, p->x11_cap_h, AllPlanes, ZPixmap);
+  p->p_XSync(p->x11_cap_dpy, False);
+  p->p_XSetErrorHandler(prev_h);
+  if (!img || !img->data || g_x11_err_flag != 0 || img->bits_per_pixel < 24) {
+    if (img) XDestroyImage(img);
+    return false;
+  }
+
+  uint32_t sw = (uint32_t)img->width;
+  uint32_t sh = (uint32_t)img->height;
+  uint32_t dw = p->width;
+  uint32_t dh = p->height;
+  uint32_t step = (uint32_t)(img->bits_per_pixel / 8);
+  const uint8_t *base = (const uint8_t *)img->data;
+
+  for (uint32_t dy = 0U; dy < dh; ++dy) {
+    uint32_t sy = (uint32_t)(((uint64_t)dy * sh) / dh);
+    const uint8_t *srow = base + (size_t)sy * (size_t)img->bytes_per_line;
+    uint8_t *drow = p->src_yuv + (size_t)dy * dw * 3U;
+    for (uint32_t dx = 0U; dx < dw; ++dx) {
+      uint32_t sx = (uint32_t)(((uint64_t)dx * sw) / dw);
+      const uint8_t *px = srow + (size_t)sx * step;
+      int32_t b = (int32_t)px[0];
+      int32_t g = (int32_t)px[1];
+      int32_t r = (int32_t)px[2];
+      int32_t y  = (77 * r + 150 * g + 29 * b + 128) >> 8;
+      int32_t cb = ((-43 * r - 85 * g + 128 * b + 128) >> 8) + 128;
+      int32_t cr = ((128 * r - 107 * g - 21 * b + 128) >> 8) + 128;
+      drow[dx * 3U + 0U] = (uint8_t)zcvid_dec_clamp_i32(y, 0, 255);
+      drow[dx * 3U + 1U] = (uint8_t)zcvid_dec_clamp_i32(cb, 0, 255);
+      drow[dx * 3U + 2U] = (uint8_t)zcvid_dec_clamp_i32(cr, 0, 255);
+    }
+  }
+  XDestroyImage(img);
+  return true;
+}
+
+static void port_x11_cleanup(gpu_pipeline_t *p) {
+  if (p->x11_img) {
+    p->x11_img->data = NULL;
+    XDestroyImage(p->x11_img);
+    p->x11_img = NULL;
+  }
+  free(p->disp_bgrx);
+  p->disp_bgrx = NULL;
+  free(p->disp_rgba);
+  p->disp_rgba = NULL;
+  if (p->x11_dpy) {
+    if (p->x11_win) p->p_XDestroyWindow(p->x11_dpy, p->x11_win);
+    p->p_XCloseDisplay(p->x11_dpy);
+    p->x11_dpy = NULL;
+    p->x11_win = 0;
+  }
+  if (p->x11_cap_dpy) {
+    p->p_XCloseDisplay(p->x11_cap_dpy);
+    p->x11_cap_dpy = NULL;
+  }
+  if (p->x11_lib) {
+    dlclose(p->x11_lib);
+    p->x11_lib = NULL;
+  }
+}
+#endif
+
 int gpu_pipeline_create(gpu_pipeline_t **out_pipe, uint32_t width,
                         uint32_t height, uint32_t fps, uint32_t bitrate_bps,
                         bool show_window, gpu_pipeline_info_t *out_info) {
@@ -1865,12 +2187,35 @@ int gpu_pipeline_create_zcvid(gpu_pipeline_t **out_pipe, uint32_t width,
     out_info->height = height;
   }
 
+#ifdef ZC_PORTABLE_HAVE_X11
+  if (show_window) {
+    if (!port_x11_open_window(p)) {
+      port_log_err("[DISPLAY] X11 window unavailable (no DISPLAY / libX11) — decoding headless.\n");
+    }
+  } else {
+    if (port_x11_open_capture(p)) {
+      p->force_synth = false;
+      if (out_info) {
+        out_info->using_desktop_dup = true;
+        snprintf(out_info->adapter_name, sizeof(out_info->adapter_name),
+                 "Linux X11 Desktop Capture (%ux%u -> %ux%u)",
+                 p->x11_cap_w, p->x11_cap_h, width, height);
+      }
+    } else {
+      port_log_err("[CAPTURE] X11 desktop capture unavailable (Wayland/headless) — falling back to synthetic test pattern.\n");
+    }
+  }
+#endif
+
   *out_pipe = p;
   return 0;
 }
 
 void gpu_pipeline_destroy(gpu_pipeline_t *p) {
   if (!p) return;
+#ifdef ZC_PORTABLE_HAVE_X11
+  port_x11_cleanup(p);
+#endif
   zcvid_gpu_dec_destroy(&p->enc_ref);
   zcvid_gpu_dec_destroy(&p->dec_state);
   free(p->src_yuv);
@@ -1951,7 +2296,27 @@ void gpu_pipeline_zcvid_set_entropy_limit(gpu_pipeline_t *p, uint32_t record_wor
 }
 
 bool gpu_pipeline_pump_events(gpu_pipeline_t *p) {
-  return p != NULL;
+  if (!p) return false;
+#ifdef ZC_PORTABLE_HAVE_X11
+  if (p->x11_win_open && p->x11_dpy) {
+    while (p->p_XPending(p->x11_dpy) > 0) {
+      XEvent ev;
+      p->p_XNextEvent(p->x11_dpy, &ev);
+      if (ev.type == ClientMessage && (Atom)ev.xclient.data.l[0] == p->x11_wm_del) {
+        p->x11_closed = true;
+      } else if (ev.type == KeyPress && p->p_XLookupKeysym(&ev.xkey, 0) == XK_Escape) {
+        p->x11_closed = true;
+      } else if (ev.type == ConfigureNotify) {
+        uint32_t nw = (ev.xconfigure.width > 64) ? (uint32_t)ev.xconfigure.width : 64U;
+        uint32_t nh = (ev.xconfigure.height > 64) ? (uint32_t)ev.xconfigure.height : 64U;
+        p->x11_win_w = nw;
+        p->x11_win_h = nh;
+      }
+    }
+    return !p->x11_closed;
+  }
+#endif
+  return true;
 }
 
 int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
@@ -1961,7 +2326,20 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
   if (!p || !out_bitstream || !out_len || !p->enc_initialized) return -1;
 
   uint64_t tc0 = qpc_now_us();
-  port_generate_synth_yuv(p->src_yuv, p->width, p->height, frame_idx);
+  bool captured = false;
+#ifdef ZC_PORTABLE_HAVE_X11
+  if (!p->force_synth && p->x11_cap_ok) {
+    captured = port_x11_capture_yuv(p);
+    if (!captured && !p->x11_cap_failed) {
+      p->x11_cap_failed = true;
+      p->x11_cap_ok = false;
+      port_log_err("[CAPTURE] X11 XGetImage failed — falling back to synthetic pattern.\n");
+    }
+  }
+#endif
+  if (!captured) {
+    port_generate_synth_yuv(p->src_yuv, p->width, p->height, frame_idx);
+  }
   uint64_t tc1 = qpc_now_us();
   if (out_cap_us) *out_cap_us = (double)(tc1 - tc0);
 
@@ -2381,9 +2759,28 @@ int gpu_pipeline_decode_and_present(gpu_pipeline_t *p,
   int rc = zcvid_gpu_dec_decode_frame(&p->dec_state, &dp,
                                       p->dec_mvs_zero ? NULL : (const zcvid_mv_t *)p->dec_mv_buf,
                                       rec_src, got_words);
+  double present_us = 0.0;
+#ifdef ZC_PORTABLE_HAVE_X11
+  if (rc == 0 && p->x11_win_open && !p->x11_closed && p->disp_rgba) {
+    uint64_t tp0 = qpc_now_us();
+    if (p->x11_img && ((uint32_t)p->x11_img->width != p->x11_win_w ||
+                       (uint32_t)p->x11_img->height != p->x11_win_h)) {
+      (void)port_x11_alloc_image(p, p->x11_win_w, p->x11_win_h);
+    }
+    if (p->x11_img && p->disp_bgrx) {
+      zcvid_gpu_dec_to_rgba(&p->dec_state, &dp, p->disp_rgba);
+      port_rgba_to_bgrx(p->disp_rgba, p->width, p->height,
+                         p->disp_bgrx, p->x11_win_w, p->x11_win_h);
+      p->p_XPutImage(p->x11_dpy, p->x11_win, p->x11_gc, p->x11_img,
+                     0, 0, 0, 0, p->x11_win_w, p->x11_win_h);
+      p->p_XFlush(p->x11_dpy);
+    }
+    present_us = (double)(qpc_now_us() - tp0);
+  }
+#endif
   uint64_t t1 = qpc_now_us();
   if (out_dec_us) *out_dec_us = (double)(t1 - t0);
-  if (out_present_us) *out_present_us = 0.0;
+  if (out_present_us) *out_present_us = present_us;
   return rc;
 }
 
