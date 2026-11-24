@@ -206,6 +206,7 @@ typedef enum {
 static void print_usage(const char *exe) {
   printf("Usage: %s --role <sender|receiver> [options]\n"
          "  --role <sender|receiver>  Required role\n"
+         "  --list-devices            Print detected monitors, audio devices, gamepads and exit\n"
          "  --codec <nvenc|zcvid|pyrowave> Video codec (default: zcvid)\n"
          "  --host <IPv4>             Receiver IP for sender (default: 127.0.0.1)\n"
          "  --port <port>             UDP port (default: 9900)\n"
@@ -216,6 +217,14 @@ static void print_usage(const char *exe) {
          "  --fec <0..4>              Cauchy GF(2^8) parity shards (default: 1)\n"
          "  --frames <N>              Stop after N frames (default: 0 = continuous)\n"
          "  --no-rio                  Disable Winsock RIO on sender\n"
+         "  --display <idx>           Display index to capture on sender (default: 0)\n"
+         "  --input / --no-input      Enable/disable keyboard & mouse forwarding (default: on)\n"
+         "  --mouse-mode <abs|rel>    Initial receiver mouse mode (default: abs)\n"
+         "  --gamepad / --no-gamepad  Enable/disable gamepad forwarding (default: on)\n"
+         "  --audio / --no-audio      Enable/disable host system audio -> client (default: on)\n"
+         "  --mic / --no-mic          Enable/disable client mic -> host playback (default: off)\n"
+         "  --audio-out <dev>         Audio output/loopback device id/index (default: default)\n"
+         "  --audio-in <dev>          Microphone input device id/index (default: default)\n"
          "  --zpsync <secret>         Enable ZPSync P2P NAT traversal with shared secret\n"
          "  --zp-peer <ip>            Optional manual peer IPv4/IPv6 (skips DHT)\n"
          "  --zp-port <port>          Optional manual peer UDP port (0 = deterministic)\n"
@@ -227,6 +236,17 @@ static void print_usage(const char *exe) {
          "  --help                    Show this help\n",
          exe);
 }
+
+typedef struct {
+  uint32_t display_idx;
+  bool input_enabled;
+  bool mouse_relative;
+  bool gamepad_enabled;
+  bool audio_enabled;
+  bool mic_enabled;
+  const char *audio_out;
+  const char *audio_in;
+} periph_opts_t;
 
 typedef struct {
   const char *secret;
@@ -315,6 +335,7 @@ static gpu_pipeline_t *create_pipeline(stream_codec_t codec, uint32_t width,
 typedef struct {
   zc_sock_t ctrl_sock;
   zc_sock_t tx_sock;
+  zc_sock_t audio_tx_sock;
   zc_video_tx_t *tx;
   gpu_pipeline_t *gpu;
   struct sockaddr_in dst_addr;
@@ -332,6 +353,13 @@ typedef struct {
    * again after ZCVID_FEC_QUIET_US without one. */
   uint8_t fec_cfg;
   uint64_t last_loss_us;
+  /* Peripherals (HID/Gamepad/Mic injection & loopback audio counters) */
+  zc_input_injector_t *inj;
+  zc_audio_ring_t *mic_ring;
+  uint64_t hid_events_rx;
+  uint64_t gp_updates_rx;
+  uint64_t audio_pkts_tx;
+  uint64_t mic_pkts_rx;
 } sender_ctrl_t;
 
 #define ZCVID_FEC_QUIET_US 2000000ULL
@@ -355,9 +383,23 @@ static void sender_fec_tick(sender_ctrl_t *c) {
   }
 }
 
+static void sender_audio_pkt_cb(const uint8_t *pkt, size_t pkt_len, void *ud) {
+  sender_ctrl_t *c = (sender_ctrl_t *)ud;
+  if (!c || c->audio_tx_sock == ZC_INVALID_SOCK) return;
+  if (c->use_connected_sock) {
+    send(c->audio_tx_sock, (const char *)pkt, (int)pkt_len, 0);
+  } else {
+    sendto(c->audio_tx_sock, (const char *)pkt, (int)pkt_len, 0,
+           (const struct sockaddr *)&c->dst_addr, (int)sizeof(c->dst_addr));
+  }
+  c->audio_pkts_tx++;
+}
+
 static void sender_poll_ctrl(sender_ctrl_t *c) {
   if (c->ctrl_sock == ZC_INVALID_SOCK) return;
-  uint8_t cbuf[ZC_NACK_HDR_SZ + 2U * ZC_NACK_MAX_FRAGS + 16U];
+  uint8_t cbuf[ZC_AUDIO_MAX_PKT_SIZE > (ZC_NACK_HDR_SZ + 2U * ZC_NACK_MAX_FRAGS + 16U)
+                   ? ZC_AUDIO_MAX_PKT_SIZE
+                   : (ZC_NACK_HDR_SZ + 2U * ZC_NACK_MAX_FRAGS + 16U)];
   bool sync_req = false;
   for (;;) {
     if (c->use_connected_sock) {
@@ -378,6 +420,31 @@ static void sender_poll_ctrl(sender_ctrl_t *c) {
                    ? recv(c->ctrl_sock, (char *)cbuf, sizeof(cbuf), 0)
                    : recvfrom(c->ctrl_sock, (char *)cbuf, sizeof(cbuf), 0, NULL, NULL);
     if (clen < 4) break;
+    if (memcmp(cbuf, ZC_INPUT_MAGIC, 4) == 0) {
+      zc_input_event_t ev;
+      if (c->inj && zc_input_unpack(cbuf, (size_t)clen, &ev) == 0) {
+        if (zc_input_injector_apply_input(c->inj, &ev) == 0) c->hid_events_rx++;
+      }
+      continue;
+    } else if (memcmp(cbuf, ZC_GAMEPAD_MAGIC, 4) == 0) {
+      zc_gamepad_state_t gp;
+      if (c->inj && zc_gamepad_unpack(cbuf, (size_t)clen, &gp) == 0) {
+        if (zc_input_injector_apply_gamepad(c->inj, &gp) == 0) c->gp_updates_rx++;
+      }
+      continue;
+    } else if (memcmp(cbuf, ZC_AUDIO_MIC_MAGIC, 4) == 0) {
+      if (c->mic_ring) {
+        int16_t pcm[ZC_AUDIO_FRAME_SAMPLES * 2U];
+        zc_audio_hdr_t ah;
+        int n = zc_audio_decode_packet(cbuf, (size_t)clen, &ah, pcm,
+                                       ZC_AUDIO_FRAME_SAMPLES * 2U);
+        if (n > 0) {
+          zc_audio_ring_push(c->mic_ring, pcm, (size_t)n * ah.channels);
+          c->mic_pkts_rx++;
+        }
+      }
+      continue;
+    }
     if (memcmp(cbuf, "ZCSY", 4) == 0) {
       sync_req = true;
     } else if (memcmp(cbuf, "ZCAC", 4) == 0 && clen >= 12) {
@@ -455,7 +522,9 @@ static int run_sender(stream_codec_t codec, const char *host, uint16_t port,
                       uint32_t bitrate_bps, uint8_t fec_shards,
                       uint64_t max_frames, bool use_rio,
                       const zc_net_impair_t *sim,
-                      const zpsync_stream_opts_t *zp_opts) {
+                      const zpsync_stream_opts_t *zp_opts,
+                      const periph_opts_t *periph) {
+  gpu_pipeline_set_display_index(periph->display_idx);
   gpu_pipeline_info_t info;
   gpu_pipeline_t *gpu =
       create_pipeline(codec, width, height, fps, bitrate_bps, false, &info);
@@ -627,6 +696,7 @@ static int run_sender(stream_codec_t codec, const char *host, uint16_t port,
   memset(&ctl, 0, sizeof(ctl));
   ctl.ctrl_sock = ctrl_sock;
   ctl.tx_sock = tx_sock;
+  ctl.audio_tx_sock = ZC_INVALID_SOCK;
   ctl.tx = tx;
   ctl.gpu = gpu;
   ctl.dst_addr = dst_addr;
@@ -640,6 +710,37 @@ static int run_sender(stream_codec_t codec, const char *host, uint16_t port,
   /* Parity only once losses show up (see sender_note_loss). */
   ctl.fec_cfg = tx->fec_shards;
   tx->fec_shards = 0U;
+
+  zc_audio_engine_t *audio_cap = NULL;
+  zc_audio_engine_t *mic_play = NULL;
+  zc_audio_ring_t *mic_ring = NULL;
+  if (periph->input_enabled || periph->gamepad_enabled) {
+    ctl.inj = zc_input_injector_create(periph->display_idx, periph->input_enabled,
+                                       periph->gamepad_enabled);
+  }
+  if (periph->audio_enabled) {
+    ctl.audio_tx_sock = zp_active ? tx_sock : socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (ctl.audio_tx_sock != ZC_INVALID_SOCK) {
+      audio_cap = zc_audio_capture_start(true, 2U, periph->audio_out,
+                                         ZC_AUDIO_OUT_MAGIC, sender_audio_pkt_cb,
+                                         &ctl);
+    }
+  }
+  if (periph->mic_enabled) {
+    mic_ring = (zc_audio_ring_t *)calloc(1, sizeof(*mic_ring));
+    if (mic_ring) {
+      zc_audio_ring_init(mic_ring);
+      ctl.mic_ring = mic_ring;
+      mic_play = zc_audio_playback_start(1U, periph->audio_out, mic_ring);
+    }
+  }
+  printf("Periphs  : display=%u | input=%s | gamepad=%s | audio_out=%s | mic_rx=%s\n",
+         (unsigned)periph->display_idx,
+         periph->input_enabled ? "ON" : "OFF",
+         periph->gamepad_enabled ? "ON" : "OFF",
+         periph->audio_enabled ? "ON" : "OFF",
+         periph->mic_enabled ? "ON" : "OFF");
+  fflush(stdout);
 
   for (uint32_t f = 0; stream_keep_running(); ++f) {
     if (max_frames > 0 && frames_sent >= max_frames) break;
@@ -701,6 +802,11 @@ static int run_sender(stream_codec_t codec, const char *host, uint16_t port,
                (unsigned long long)hf, (unsigned long long)hm, (unsigned long long)hmt,
                (unsigned long long)hst);
       }
+      printf("[PERIPH] hid=%llu gp=%llu audio=%llu mic=%llu\n",
+             (unsigned long long)ctl.hid_events_rx,
+             (unsigned long long)ctl.gp_updates_rx,
+             (unsigned long long)ctl.audio_pkts_tx,
+             (unsigned long long)ctl.mic_pkts_rx);
       fflush(stdout);
       last_report_us = now_us;
       frames_period = 0;
@@ -778,6 +884,13 @@ static int run_sender(stream_codec_t codec, const char *host, uint16_t port,
 #ifdef _WIN32
   if (pace_timer) CloseHandle(pace_timer);
 #endif
+  if (audio_cap) zc_audio_engine_stop(audio_cap);
+  if (mic_play) zc_audio_engine_stop(mic_play);
+  free(mic_ring);
+  if (ctl.inj) zc_input_injector_destroy(ctl.inj);
+  if (!zp_active && ctl.audio_tx_sock != ZC_INVALID_SOCK) {
+    zc_closesocket(ctl.audio_tx_sock);
+  }
   bool had_rio = tx->rio_ready;
   zc_video_tx_destroy(tx);
   free(tx);
@@ -791,10 +904,49 @@ static int run_sender(stream_codec_t codec, const char *host, uint16_t port,
   return 0;
 }
 
+typedef struct {
+  zc_sock_t tx_sock;
+  bool zp_active;
+  bool ready_to_send;
+  struct sockaddr_in sender_addr;
+  uint64_t hid_tx;
+  uint64_t mic_tx;
+} receiver_periph_tx_t;
+
+static void receiver_input_cb(const zc_input_event_t *ev, void *ud) {
+  receiver_periph_tx_t *rxp = (receiver_periph_tx_t *)ud;
+  if (!rxp || !rxp->ready_to_send || rxp->tx_sock == ZC_INVALID_SOCK) return;
+  uint8_t pkt[ZC_INPUT_PKT_SIZE];
+  if (zc_input_pack(ev, pkt) > 0) {
+    if (rxp->zp_active) {
+      send(rxp->tx_sock, (const char *)pkt, (int)sizeof(pkt), 0);
+    } else {
+      sendto(rxp->tx_sock, (const char *)pkt, (int)sizeof(pkt), 0,
+             (const struct sockaddr *)&rxp->sender_addr,
+             (int)sizeof(rxp->sender_addr));
+    }
+    rxp->hid_tx++;
+  }
+}
+
+static void receiver_mic_cb(const uint8_t *pkt, size_t pkt_len, void *ud) {
+  receiver_periph_tx_t *rxp = (receiver_periph_tx_t *)ud;
+  if (!rxp || !rxp->ready_to_send || rxp->tx_sock == ZC_INVALID_SOCK) return;
+  if (rxp->zp_active) {
+    send(rxp->tx_sock, (const char *)pkt, (int)pkt_len, 0);
+  } else {
+    sendto(rxp->tx_sock, (const char *)pkt, (int)pkt_len, 0,
+           (const struct sockaddr *)&rxp->sender_addr,
+           (int)sizeof(rxp->sender_addr));
+  }
+  rxp->mic_tx++;
+}
+
 static int run_receiver(stream_codec_t codec, uint16_t port, uint32_t width,
                         uint32_t height, uint32_t fps, uint32_t bitrate_bps,
                         uint64_t max_frames,
-                        const zpsync_stream_opts_t *zp_opts) {
+                        const zpsync_stream_opts_t *zp_opts,
+                        const periph_opts_t *periph) {
   gpu_pipeline_info_t info;
   gpu_pipeline_t *gpu =
       create_pipeline(codec, width, height, fps, bitrate_bps, true, &info);
@@ -900,12 +1052,48 @@ static int run_receiver(stream_codec_t codec, uint16_t port, uint32_t width,
   uint64_t last_report_us = qpc_now_us();
   uint64_t last_sync_req_us = 0;
   uint64_t last_caps_us = 0;
+  uint64_t last_gp_hb_us = 0;
   uint64_t prev_drops = 0;
   bool need_sync = false;
   uint32_t last_rx_fid = 0; /* id of the last frame handed to the decoder */
   struct sockaddr_in sender_addr;
   memset(&sender_addr, 0, sizeof(sender_addr));
   bool have_sender_addr = zp_active;
+
+  receiver_periph_tx_t rxp;
+  memset(&rxp, 0, sizeof(rxp));
+  rxp.zp_active = zp_active;
+  rxp.tx_sock = zp_active ? rx_sock : socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  rxp.ready_to_send = zp_active;
+
+  if (periph->input_enabled) {
+    gpu_pipeline_set_input_callback(gpu, receiver_input_cb, &rxp);
+    gpu_pipeline_set_mouse_relative(gpu, periph->mouse_relative);
+  }
+  zc_gamepad_poller_t *gp_poller =
+      periph->gamepad_enabled ? zc_gamepad_poller_create() : NULL;
+  zc_audio_ring_t *audio_ring = NULL;
+  zc_audio_engine_t *audio_play = NULL;
+  if (periph->audio_enabled) {
+    audio_ring = (zc_audio_ring_t *)calloc(1, sizeof(*audio_ring));
+    if (audio_ring) {
+      zc_audio_ring_init(audio_ring);
+      audio_play = zc_audio_playback_start(2U, periph->audio_out, audio_ring);
+    }
+  }
+  zc_audio_engine_t *mic_cap = NULL;
+  if (periph->mic_enabled) {
+    mic_cap = zc_audio_capture_start(false, 1U, periph->audio_in,
+                                     ZC_AUDIO_MIC_MAGIC, receiver_mic_cb, &rxp);
+  }
+  uint64_t gp_tx_cnt = 0;
+  uint64_t audio_rx_cnt = 0;
+  log_out("Periphs  : input=%s (%s) | gamepad=%s | audio=%s | mic=%s\n",
+          periph->input_enabled ? "ON" : "OFF",
+          periph->mouse_relative ? "rel" : "abs",
+          periph->gamepad_enabled ? "ON" : "OFF",
+          periph->audio_enabled ? "ON" : "OFF",
+          periph->mic_enabled ? "ON" : "OFF");
 
   while (stream_keep_running()) {
     if (!gpu_pipeline_pump_events(gpu)) break;
@@ -938,12 +1126,27 @@ static int run_receiver(stream_codec_t codec, uint16_t port, uint32_t width,
         if (!zp_active && !have_sender_addr && src_len == (zc_socklen_t)sizeof(src_addr)) {
           sender_addr = src_addr;
           sender_addr.sin_port = htons((uint16_t)(port + 1U));
+          rxp.sender_addr = sender_addr;
+          rxp.ready_to_send = true;
           have_sender_addr = true;
         }
         pkts_period++;
         if (!seen_first_pkt) {
           seen_first_pkt = true;
           log_out("[RECEIVER] first UDP packet received (%d bytes)\n", rlen);
+        }
+        if (rlen >= (int)ZC_AUDIO_HDR_SIZE && memcmp(pkt, ZC_AUDIO_OUT_MAGIC, 4) == 0) {
+          if (audio_ring) {
+            int16_t pcm[ZC_AUDIO_FRAME_SAMPLES * 2U];
+            zc_audio_hdr_t ah;
+            int ns = zc_audio_decode_packet(pkt, (size_t)rlen, &ah, pcm,
+                                            ZC_AUDIO_FRAME_SAMPLES * 2U);
+            if (ns > 0) {
+              zc_audio_ring_push(audio_ring, pcm, (size_t)ns * ah.channels);
+              audio_rx_cnt++;
+            }
+          }
+          continue;
         }
         if (zc_video_rx_feed(rx, pkt, (size_t)rlen, NULL, NULL, NULL, NULL) < 0) {
           rx_err_period++;
@@ -1024,6 +1227,27 @@ static int run_receiver(stream_codec_t codec, uint16_t port, uint32_t width,
                  (const struct sockaddr *)&sender_addr, (int)sizeof(sender_addr));
         }
       }
+      if (gp_poller && (zp_active || port < 65535U)) {
+        zc_gamepad_state_t gps[ZC_MAX_GAMEPADS];
+        bool chg[ZC_MAX_GAMEPADS];
+        int active_gps = zc_gamepad_poller_poll(gp_poller, gps, chg);
+        bool hb = (active_gps > 0 && (now_ctl - last_gp_hb_us >= 250000ULL));
+        if (hb) last_gp_hb_us = now_ctl;
+        for (uint32_t gi = 0; gi < ZC_MAX_GAMEPADS; ++gi) {
+          if (chg[gi] || (hb && gps[gi].connected)) {
+            uint8_t gpkt[ZC_GAMEPAD_PKT_SIZE];
+            if (zc_gamepad_pack(&gps[gi], gpkt) > 0) {
+              if (zp_active) {
+                send(rx_sock, (const char *)gpkt, (int)sizeof(gpkt), 0);
+              } else {
+                sendto(rx_sock, (const char *)gpkt, (int)sizeof(gpkt), 0,
+                       (const struct sockaddr *)&sender_addr, (int)sizeof(sender_addr));
+              }
+              gp_tx_cnt++;
+            }
+          }
+        }
+      }
       if (codec == CODEC_ZCVID) {
         /* Capability notice, repeated since it travels unprotected: range
          * coding is understood, and this many record words per frame can be
@@ -1076,6 +1300,11 @@ static int run_receiver(stream_codec_t codec, uint16_t port, uint32_t width,
               (unsigned long long)pkts_period,
               (unsigned long long)rx_err_period,
               (unsigned long long)dec_fail_period);
+      log_out("[PERIPH] hid=%llu gp=%llu audio=%llu mic=%llu\n",
+              (unsigned long long)rxp.hid_tx,
+              (unsigned long long)gp_tx_cnt,
+              (unsigned long long)audio_rx_cnt,
+              (unsigned long long)rxp.mic_tx);
       last_report_us = now_us;
       frames_period = 0;
       bytes_period = 0;
@@ -1090,6 +1319,13 @@ static int run_receiver(stream_codec_t codec, uint16_t port, uint32_t width,
           (unsigned long long)rx->frames_completed,
           (unsigned long long)rx->frames_fec_recovered,
           (unsigned long long)rx->frames_dropped);
+
+  gpu_pipeline_set_input_callback(gpu, NULL, NULL);
+  if (mic_cap) zc_audio_engine_stop(mic_cap);
+  if (audio_play) zc_audio_engine_stop(audio_play);
+  free(audio_ring);
+  if (gp_poller) zc_gamepad_poller_destroy(gp_poller);
+  if (!zp_active && rxp.tx_sock != ZC_INVALID_SOCK) zc_closesocket(rxp.tx_sock);
 
   zc_video_rx_destroy(rx);
   free(rx);
@@ -1118,11 +1354,48 @@ int main(int argc, char **argv) {
   memset(&sim, 0, sizeof(sim));
   zpsync_stream_opts_t zp_opts;
   memset(&zp_opts, 0, sizeof(zp_opts));
+  periph_opts_t periph;
+  memset(&periph, 0, sizeof(periph));
+  periph.input_enabled = true;
+  periph.gamepad_enabled = true;
+  periph.audio_enabled = true;
+  periph.mic_enabled = false;
+  periph.audio_out = "default";
+  periph.audio_in = "default";
+  bool list_devices = false;
 
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
       print_usage(argv[0]);
       return 0;
+    } else if (strcmp(argv[i], "--list-devices") == 0) {
+      list_devices = true;
+    } else if (strcmp(argv[i], "--display") == 0 && i + 1 < argc) {
+      int d = atoi(argv[++i]);
+      periph.display_idx = (d > 0) ? (uint32_t)d : 0U;
+    } else if (strcmp(argv[i], "--input") == 0) {
+      periph.input_enabled = true;
+    } else if (strcmp(argv[i], "--no-input") == 0) {
+      periph.input_enabled = false;
+    } else if (strcmp(argv[i], "--mouse-mode") == 0 && i + 1 < argc) {
+      const char *m = argv[++i];
+      periph.mouse_relative = (strcmp(m, "rel") == 0);
+    } else if (strcmp(argv[i], "--gamepad") == 0) {
+      periph.gamepad_enabled = true;
+    } else if (strcmp(argv[i], "--no-gamepad") == 0) {
+      periph.gamepad_enabled = false;
+    } else if (strcmp(argv[i], "--audio") == 0) {
+      periph.audio_enabled = true;
+    } else if (strcmp(argv[i], "--no-audio") == 0) {
+      periph.audio_enabled = false;
+    } else if (strcmp(argv[i], "--mic") == 0) {
+      periph.mic_enabled = true;
+    } else if (strcmp(argv[i], "--no-mic") == 0) {
+      periph.mic_enabled = false;
+    } else if (strcmp(argv[i], "--audio-out") == 0 && i + 1 < argc) {
+      periph.audio_out = argv[++i];
+    } else if (strcmp(argv[i], "--audio-in") == 0 && i + 1 < argc) {
+      periph.audio_in = argv[++i];
     } else if (strcmp(argv[i], "--role") == 0 && i + 1 < argc) {
       const char *v = argv[++i];
       if (strcmp(v, "sender") == 0) role = ROLE_SENDER;
@@ -1189,6 +1462,11 @@ int main(int argc, char **argv) {
     }
   }
 
+  if (list_devices) {
+    zc_periph_print_devices(stdout);
+    return 0;
+  }
+
   if (role == ROLE_NONE) {
     print_usage(argv[0]);
     return 1;
@@ -1238,10 +1516,10 @@ int main(int argc, char **argv) {
   if (role == ROLE_SENDER) {
     rc = run_sender(codec, host, port, width, height, fps,
                     bitrate_mbps * 1000000U, fec_shards, max_frames, use_rio, &sim,
-                    &zp_opts);
+                    &zp_opts, &periph);
   } else {
     rc = run_receiver(codec, port, width, height, fps, bitrate_mbps * 1000000U,
-                      max_frames, &zp_opts);
+                      max_frames, &zp_opts, &periph);
   }
 
   gpu_pipeline_set_log_file(NULL);

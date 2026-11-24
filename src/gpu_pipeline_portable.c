@@ -1231,6 +1231,12 @@ struct gpu_pipeline_s {
   uint64_t hint_moved_tiles;
   uint64_t hint_static_tiles;
 
+  gpu_input_cb_t input_cb;
+  void *input_ud;
+  bool mouse_relative;
+  bool mouse_locked;
+  uint32_t input_seq;
+
 #ifdef ZC_PORTABLE_HAVE_X11
   void *x11_lib;
   Display *x11_dpy;
@@ -1283,6 +1289,9 @@ struct gpu_pipeline_s {
   XErrorHandler (*p_XSetErrorHandler)(XErrorHandler);
   int (*p_XSync)(Display *, Bool);
   KeySym (*p_XLookupKeysym)(XKeyEvent *, int);
+  int (*p_XGrabPointer)(Display *, Window, Bool, unsigned int, int, int, Window, Cursor, Time);
+  int (*p_XUngrabPointer)(Display *, Time);
+  int (*p_XWarpPointer)(Display *, Window, Window, int, int, unsigned int, unsigned int, int, int);
 #endif
 };
 
@@ -1865,6 +1874,14 @@ static bool port_x11_load(gpu_pipeline_t *p) {
   ZC_X11_DLSYM(lib, p->p_XSetErrorHandler, "XSetErrorHandler");
   ZC_X11_DLSYM(lib, p->p_XSync, "XSync");
   ZC_X11_DLSYM(lib, p->p_XLookupKeysym, "XLookupKeysym");
+  {
+    void *s_grab = dlsym(lib, "XGrabPointer");
+    void *s_ungrab = dlsym(lib, "XUngrabPointer");
+    void *s_warp = dlsym(lib, "XWarpPointer");
+    if (s_grab) memcpy(&p->p_XGrabPointer, &s_grab, sizeof(p->p_XGrabPointer));
+    if (s_ungrab) memcpy(&p->p_XUngrabPointer, &s_ungrab, sizeof(p->p_XUngrabPointer));
+    if (s_warp) memcpy(&p->p_XWarpPointer, &s_warp, sizeof(p->p_XWarpPointer));
+  }
   return true;
 }
 
@@ -1925,7 +1942,10 @@ static bool port_x11_open_window(gpu_pipeline_t *p) {
 
   Window win = p->p_XCreateSimpleWindow(dpy, root, 0, 0, win_w, win_h, 0, 0, 0);
   p->p_XStoreName(dpy, win, "zcstream — Zcvid Live Receiver");
-  p->p_XSelectInput(dpy, win, StructureNotifyMask | ExposureMask | KeyPressMask);
+  p->p_XSelectInput(dpy, win,
+                    StructureNotifyMask | ExposureMask | KeyPressMask | KeyReleaseMask |
+                        ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
+                        FocusChangeMask);
   Atom wm_del = p->p_XInternAtom(dpy, "WM_DELETE_WINDOW", False);
   p->p_XSetWMProtocols(dpy, win, &wm_del, 1);
 
@@ -2295,6 +2315,57 @@ void gpu_pipeline_zcvid_set_entropy_limit(gpu_pipeline_t *p, uint32_t record_wor
   if (p) p->entropy_limit_words = record_words & ~1U;
 }
 
+static void port_x11_set_mouse_lock(gpu_pipeline_t *p, bool lock) {
+#ifdef ZC_PORTABLE_HAVE_X11
+  if (!p || !p->x11_dpy || !p->x11_win) return;
+  if (lock) {
+    if (p->p_XGrabPointer) {
+      p->p_XGrabPointer(p->x11_dpy, p->x11_win, True,
+                        ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
+                        GrabModeAsync, GrabModeAsync, p->x11_win, None, CurrentTime);
+    }
+    if (p->p_XWarpPointer && p->x11_win_w > 1U && p->x11_win_h > 1U) {
+      p->p_XWarpPointer(p->x11_dpy, None, p->x11_win, 0, 0, 0, 0,
+                        (int)(p->x11_win_w / 2U), (int)(p->x11_win_h / 2U));
+    }
+    p->p_XStoreName(p->x11_dpy, p->x11_win,
+                    "zcstream — Live Receiver [Souris FPS | Ctrl+Alt+Shift+M pour libérer]");
+    p->mouse_locked = true;
+  } else {
+    if (p->p_XUngrabPointer) {
+      p->p_XUngrabPointer(p->x11_dpy, CurrentTime);
+    }
+    p->p_XStoreName(p->x11_dpy, p->x11_win, "zcstream — Zcvid Live Receiver");
+    p->mouse_locked = false;
+  }
+  p->p_XFlush(p->x11_dpy);
+#else
+  (void)p; (void)lock;
+#endif
+}
+
+void gpu_pipeline_set_display_index(uint32_t display_idx) {
+  (void)display_idx;
+}
+
+void gpu_pipeline_set_input_callback(gpu_pipeline_t *p, gpu_input_cb_t cb, void *userdata) {
+  if (!p) return;
+  p->input_cb = cb;
+  p->input_ud = userdata;
+}
+
+void gpu_pipeline_set_mouse_relative(gpu_pipeline_t *p, bool relative) {
+  if (!p) return;
+  p->mouse_relative = relative;
+  if (!relative && p->mouse_locked) {
+    port_x11_set_mouse_lock(p, false);
+  }
+}
+
+bool gpu_pipeline_get_mouse_relative(gpu_pipeline_t *p) {
+  return p ? p->mouse_relative : false;
+}
+
 bool gpu_pipeline_pump_events(gpu_pipeline_t *p) {
   if (!p) return false;
 #ifdef ZC_PORTABLE_HAVE_X11
@@ -2303,14 +2374,114 @@ bool gpu_pipeline_pump_events(gpu_pipeline_t *p) {
       XEvent ev;
       p->p_XNextEvent(p->x11_dpy, &ev);
       if (ev.type == ClientMessage && (Atom)ev.xclient.data.l[0] == p->x11_wm_del) {
+        if (p->mouse_locked) port_x11_set_mouse_lock(p, false);
         p->x11_closed = true;
-      } else if (ev.type == KeyPress && p->p_XLookupKeysym(&ev.xkey, 0) == XK_Escape) {
-        p->x11_closed = true;
+      } else if (ev.type == FocusOut) {
+        if (p->mouse_locked) port_x11_set_mouse_lock(p, false);
       } else if (ev.type == ConfigureNotify) {
         uint32_t nw = (ev.xconfigure.width > 64) ? (uint32_t)ev.xconfigure.width : 64U;
         uint32_t nh = (ev.xconfigure.height > 64) ? (uint32_t)ev.xconfigure.height : 64U;
         p->x11_win_w = nw;
         p->x11_win_h = nh;
+      } else if (ev.type == KeyPress || ev.type == KeyRelease) {
+        bool down = (ev.type == KeyPress);
+        KeySym ks = p->p_XLookupKeysym(&ev.xkey, 0);
+        bool mods = ((ev.xkey.state & (ControlMask | Mod1Mask | ShiftMask)) ==
+                     (ControlMask | Mod1Mask | ShiftMask));
+        if (down && mods && (ks == XK_m || ks == XK_M)) {
+          p->mouse_relative = !p->mouse_relative;
+          port_x11_set_mouse_lock(p, p->mouse_relative);
+          continue;
+        }
+        if (down && mods && (ks == XK_q || ks == XK_Q)) {
+          if (p->mouse_locked) port_x11_set_mouse_lock(p, false);
+          p->x11_closed = true;
+          continue;
+        }
+        if (!p->input_cb) {
+          if (down && ks == XK_Escape) p->x11_closed = true;
+          continue;
+        }
+        if (ev.xkey.keycode >= 8U) {
+          uint16_t evdev = (uint16_t)(ev.xkey.keycode - 8U);
+          uint16_t set1 = 0;
+          bool ext = false;
+          if (zc_scancode_evdev_to_set1(evdev, &set1, &ext)) {
+            zc_input_event_t ie;
+            memset(&ie, 0, sizeof(ie));
+            ie.kind = ZC_INPUT_KEY;
+            ie.flags = (uint8_t)((down ? ZC_INPUT_FLAG_DOWN : 0U) |
+                                 (ext ? ZC_INPUT_FLAG_EXTENDED : 0U));
+            ie.code = set1;
+            ie.seq = ++p->input_seq;
+            p->input_cb(&ie, p->input_ud);
+          }
+        }
+      } else if (ev.type == ButtonPress || ev.type == ButtonRelease) {
+        if (!p->input_cb) continue;
+        bool down = (ev.type == ButtonPress);
+        unsigned int b = ev.xbutton.button;
+        if (down && b == 1U && p->mouse_relative && !p->mouse_locked) {
+          port_x11_set_mouse_lock(p, true);
+        }
+        if (b >= 4U && b <= 7U) {
+          if (!down) continue;
+          zc_input_event_t ie;
+          memset(&ie, 0, sizeof(ie));
+          ie.kind = ZC_INPUT_MOUSE_WHEEL;
+          if (b == 4U) ie.y = 120;
+          else if (b == 5U) ie.y = -120;
+          else if (b == 6U) { ie.flags = ZC_INPUT_FLAG_HORIZ; ie.x = -120; }
+          else { ie.flags = ZC_INPUT_FLAG_HORIZ; ie.x = 120; }
+          ie.seq = ++p->input_seq;
+          p->input_cb(&ie, p->input_ud);
+        } else {
+          uint16_t mb = 0;
+          if (b == 1U) mb = ZC_MOUSE_BTN_LEFT;
+          else if (b == 2U) mb = ZC_MOUSE_BTN_MIDDLE;
+          else if (b == 3U) mb = ZC_MOUSE_BTN_RIGHT;
+          else if (b == 8U) mb = ZC_MOUSE_BTN_X1;
+          else if (b == 9U) mb = ZC_MOUSE_BTN_X2;
+          if (mb != 0U) {
+            zc_input_event_t ie;
+            memset(&ie, 0, sizeof(ie));
+            ie.kind = ZC_INPUT_MOUSE_BTN;
+            ie.flags = (uint8_t)(down ? ZC_INPUT_FLAG_DOWN : 0U);
+            ie.code = mb;
+            ie.seq = ++p->input_seq;
+            p->input_cb(&ie, p->input_ud);
+          }
+        }
+      } else if (ev.type == MotionNotify && p->input_cb) {
+        zc_input_event_t ie;
+        memset(&ie, 0, sizeof(ie));
+        if (p->mouse_locked && p->x11_win_w > 1U && p->x11_win_h > 1U) {
+          int cx = (int)(p->x11_win_w / 2U);
+          int cy = (int)(p->x11_win_h / 2U);
+          int dx = ev.xmotion.x - cx;
+          int dy = ev.xmotion.y - cy;
+          if (dx != 0 || dy != 0) {
+            ie.kind = ZC_INPUT_MOUSE_REL;
+            ie.x = dx;
+            ie.y = dy;
+            ie.seq = ++p->input_seq;
+            p->input_cb(&ie, p->input_ud);
+            if (p->p_XWarpPointer) {
+              p->p_XWarpPointer(p->x11_dpy, None, p->x11_win, 0, 0, 0, 0, cx, cy);
+              p->p_XFlush(p->x11_dpy);
+            }
+          }
+        } else if (p->x11_win_w > 1U && p->x11_win_h > 1U) {
+          int mx = ev.xmotion.x < 0 ? 0 : ev.xmotion.x;
+          int my = ev.xmotion.y < 0 ? 0 : ev.xmotion.y;
+          if ((uint32_t)mx >= p->x11_win_w) mx = (int)p->x11_win_w - 1;
+          if ((uint32_t)my >= p->x11_win_h) my = (int)p->x11_win_h - 1;
+          ie.kind = ZC_INPUT_MOUSE_ABS;
+          ie.x = (int32_t)(((int64_t)mx * 65535) / (int64_t)(p->x11_win_w - 1U));
+          ie.y = (int32_t)(((int64_t)my * 65535) / (int64_t)(p->x11_win_h - 1U));
+          ie.seq = ++p->input_seq;
+          p->input_cb(&ie, p->input_ud);
+        }
       }
     }
     return !p->x11_closed;

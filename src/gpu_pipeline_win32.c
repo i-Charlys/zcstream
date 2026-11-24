@@ -207,6 +207,12 @@ struct gpu_pipeline_s {
   HWND hwnd;
   bool show_window;
   bool window_closed;
+  gpu_input_cb_t input_cb;
+  void *input_ud;
+  bool mouse_relative;
+  bool mouse_locked;
+  uint32_t input_seq;
+  bool cursor_hidden;
   bool tearing_supported;
   bool using_desktop_dup;
   bool dupl_has_frame; /* cap_bgra_tex holds a duplicated desktop frame */
@@ -458,10 +464,198 @@ struct gpu_pipeline_s {
 #endif
 };
 
+static uint32_t g_display_idx = 0U;
+
+void gpu_pipeline_set_display_index(uint32_t display_idx) {
+  g_display_idx = display_idx;
+}
+
+static void win_set_mouse_lock(gpu_pipeline_t *p, bool lock) {
+  if (!p || !p->hwnd) return;
+  if (lock) {
+    RECT rc;
+    if (GetClientRect(p->hwnd, &rc)) {
+      POINT tl = {rc.left, rc.top};
+      POINT br = {rc.right, rc.bottom};
+      ClientToScreen(p->hwnd, &tl);
+      ClientToScreen(p->hwnd, &br);
+      RECT scr = {tl.x, tl.y, br.x, br.y};
+      ClipCursor(&scr);
+    }
+    if (!p->cursor_hidden) {
+      ShowCursor(FALSE);
+      p->cursor_hidden = true;
+    }
+    p->mouse_locked = true;
+    SetWindowTextA(p->hwnd, "zcstream — Live Receiver [Souris FPS verrouillée | Ctrl+Alt+Shift+M pour libérer]");
+  } else {
+    ClipCursor(NULL);
+    if (p->cursor_hidden) {
+      ShowCursor(TRUE);
+      p->cursor_hidden = false;
+    }
+    p->mouse_locked = false;
+    SetWindowTextA(p->hwnd, "zcrudp + D3D11 Zero-Copy Video Pipeline");
+  }
+}
+
+void gpu_pipeline_set_input_callback(gpu_pipeline_t *pipe, gpu_input_cb_t cb, void *userdata) {
+  if (!pipe) return;
+  pipe->input_cb = cb;
+  pipe->input_ud = userdata;
+}
+
+void gpu_pipeline_set_mouse_relative(gpu_pipeline_t *pipe, bool relative) {
+  if (!pipe) return;
+  pipe->mouse_relative = relative;
+  if (!relative && pipe->mouse_locked) {
+    win_set_mouse_lock(pipe, false);
+  }
+}
+
+bool gpu_pipeline_get_mouse_relative(gpu_pipeline_t *pipe) {
+  return pipe ? pipe->mouse_relative : false;
+}
+
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+  gpu_pipeline_t *p = (gpu_pipeline_t *)(LONG_PTR)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
   if (msg == WM_DESTROY || msg == WM_CLOSE) {
+    if (p) {
+      if (p->mouse_locked) win_set_mouse_lock(p, false);
+      p->window_closed = true;
+    }
     PostQuitMessage(0);
     return 0;
+  }
+  if (msg == WM_KILLFOCUS) {
+    if (p && p->mouse_locked) win_set_mouse_lock(p, false);
+    return 0;
+  }
+  if (!p || !p->input_cb) {
+    return DefWindowProcA(hwnd, msg, wp, lp);
+  }
+
+  switch (msg) {
+    case WM_KEYDOWN:
+    case WM_KEYUP:
+    case WM_SYSKEYDOWN:
+    case WM_SYSKEYUP: {
+      bool down = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN);
+      bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+      bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+      bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+      if (down && ctrl && alt && shift) {
+        if (wp == 'M') {
+          p->mouse_relative = !p->mouse_relative;
+          win_set_mouse_lock(p, p->mouse_relative);
+          return 0;
+        }
+        if (wp == 'Q') {
+          if (p->mouse_locked) win_set_mouse_lock(p, false);
+          p->window_closed = true;
+          PostQuitMessage(0);
+          return 0;
+        }
+      }
+      zc_input_event_t ev;
+      memset(&ev, 0, sizeof(ev));
+      ev.kind = ZC_INPUT_KEY;
+      ev.flags = (uint8_t)(down ? ZC_INPUT_FLAG_DOWN : 0U);
+      if (((lp >> 24) & 1L) != 0L) ev.flags |= ZC_INPUT_FLAG_EXTENDED;
+      ev.code = (uint16_t)((lp >> 16) & 0xFFL);
+      ev.seq = ++p->input_seq;
+      if (ev.code != 0U) p->input_cb(&ev, p->input_ud);
+      if (msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP) return 0;
+      break;
+    }
+    case WM_MOUSEMOVE: {
+      if (!p->mouse_locked) {
+        RECT rc;
+        if (GetClientRect(hwnd, &rc) && rc.right > 1 && rc.bottom > 1) {
+          int mx = (int)(short)(lp & 0xFFFF);
+          int my = (int)(short)((lp >> 16) & 0xFFFF);
+          if (mx < 0) mx = 0;
+          if (my < 0) my = 0;
+          if (mx >= rc.right) mx = rc.right - 1;
+          if (my >= rc.bottom) my = rc.bottom - 1;
+          zc_input_event_t ev;
+          memset(&ev, 0, sizeof(ev));
+          ev.kind = ZC_INPUT_MOUSE_ABS;
+          ev.x = (int32_t)(((int64_t)mx * 65535) / (rc.right - 1));
+          ev.y = (int32_t)(((int64_t)my * 65535) / (rc.bottom - 1));
+          ev.seq = ++p->input_seq;
+          p->input_cb(&ev, p->input_ud);
+        }
+      }
+      break;
+    }
+    case WM_INPUT: {
+      if (p->mouse_locked) {
+        RAWINPUT raw;
+        UINT sz = sizeof(raw);
+        if (GetRawInputData((HRAWINPUT)lp, RID_INPUT, &raw, &sz,
+                            sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
+            raw.header.dwType == RIM_TYPEMOUSE &&
+            !(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) &&
+            (raw.data.mouse.lLastX != 0 || raw.data.mouse.lLastY != 0)) {
+          zc_input_event_t ev;
+          memset(&ev, 0, sizeof(ev));
+          ev.kind = ZC_INPUT_MOUSE_REL;
+          ev.x = (int32_t)raw.data.mouse.lLastX;
+          ev.y = (int32_t)raw.data.mouse.lLastY;
+          ev.seq = ++p->input_seq;
+          p->input_cb(&ev, p->input_ud);
+        }
+      }
+      break;
+    }
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONUP:
+    case WM_MBUTTONDOWN:
+    case WM_MBUTTONUP:
+    case WM_XBUTTONDOWN:
+    case WM_XBUTTONUP: {
+      bool down = (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN ||
+                   msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN);
+      if (down && p->mouse_relative && !p->mouse_locked) {
+        win_set_mouse_lock(p, true);
+      }
+      uint16_t btn = ZC_MOUSE_BTN_LEFT;
+      if (msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP) btn = ZC_MOUSE_BTN_RIGHT;
+      else if (msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP) btn = ZC_MOUSE_BTN_MIDDLE;
+      else if (msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP) {
+        btn = (HIWORD(wp) == XBUTTON1) ? ZC_MOUSE_BTN_X1 : ZC_MOUSE_BTN_X2;
+      }
+      zc_input_event_t ev;
+      memset(&ev, 0, sizeof(ev));
+      ev.kind = ZC_INPUT_MOUSE_BTN;
+      ev.flags = (uint8_t)(down ? ZC_INPUT_FLAG_DOWN : 0U);
+      ev.code = btn;
+      ev.seq = ++p->input_seq;
+      p->input_cb(&ev, p->input_ud);
+      if (msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP) return TRUE;
+      return 0;
+    }
+    case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL: {
+      int delta = (int)(short)HIWORD(wp);
+      zc_input_event_t ev;
+      memset(&ev, 0, sizeof(ev));
+      ev.kind = ZC_INPUT_MOUSE_WHEEL;
+      if (msg == WM_MOUSEHWHEEL) {
+        ev.flags = ZC_INPUT_FLAG_HORIZ;
+        ev.x = delta;
+      } else {
+        ev.y = delta;
+      }
+      ev.seq = ++p->input_seq;
+      p->input_cb(&ev, p->input_ud);
+      return 0;
+    }
+    default:
+      break;
   }
   return DefWindowProcA(hwnd, msg, wp, lp);
 }
@@ -551,10 +745,13 @@ static int create_d3d11_and_swapchain(gpu_pipeline_t *p, bool show_window,
   p->tearing_supported = (allow_tear == TRUE);
   info->tearing_supported = p->tearing_supported;
 
-  /* Try Desktop Duplication on chosen adapter's first output */
+  /* Try Desktop Duplication on chosen adapter's selected output */
   if (chosen) {
     IDXGIOutput *out = NULL;
-    if (SUCCEEDED(IDXGIAdapter1_EnumOutputs(chosen, 0, &out))) {
+    if (FAILED(IDXGIAdapter1_EnumOutputs(chosen, g_display_idx, &out)) && g_display_idx != 0U) {
+      IDXGIAdapter1_EnumOutputs(chosen, 0, &out);
+    }
+    if (out) {
       /* The output is kept: duplication is lost on every mode switch or
        * secure-desktop prompt and has to be started again. */
       if (SUCCEEDED(IDXGIOutput_QueryInterface(out, &IID_IDXGIOutput1,
@@ -580,6 +777,17 @@ static int create_d3d11_and_swapchain(gpu_pipeline_t *p, bool show_window,
                             "zcrudp + D3D11 Zero-Copy Video Pipeline", style,
                             100, 100, (int)p->width / 2, (int)p->height / 2,
                             NULL, NULL, wc.hInstance, NULL);
+  if (p->hwnd) {
+    SetWindowLongPtrA(p->hwnd, GWLP_USERDATA, (LONG_PTR)p);
+    if (show_window) {
+      RAWINPUTDEVICE rid;
+      rid.usUsagePage = 0x01;
+      rid.usUsage = 0x02; /* Mouse */
+      rid.dwFlags = 0;
+      rid.hwndTarget = p->hwnd;
+      RegisterRawInputDevices(&rid, 1, sizeof(rid));
+    }
+  }
 
   DXGI_SWAP_CHAIN_DESC1 scd = {0};
   scd.Width = p->width;

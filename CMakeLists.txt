@@ -247,13 +247,14 @@ endif()
 add_executable(test_portable_pipeline
   tests/test_portable_pipeline.c
   src/gpu_pipeline_portable.c
+  src/zc_periph.c
 )
 target_include_directories(test_portable_pipeline PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${ZCVID_DIR}/include"
 )
 if(WIN32)
-  target_link_libraries(test_portable_pipeline PRIVATE zcrudp_lib)
+  target_link_libraries(test_portable_pipeline PRIVATE zcrudp_lib ole32 user32)
 else()
   target_link_libraries(test_portable_pipeline PRIVATE zcrudp_lib m Threads::Threads ${CMAKE_DL_LIBS})
 endif()
@@ -263,6 +264,26 @@ else()
   target_compile_options(test_portable_pipeline PRIVATE -O2 -UNDEBUG -Wall -Wextra)
 endif()
 add_test(NAME test_portable_pipeline COMMAND test_portable_pipeline)
+
+# Peripheral I/O unit test (wire packets, scancodes, ADPCM, SPSC ring, enumeration)
+add_executable(test_periph
+  tests/test_periph.c
+  src/zc_periph.c
+)
+target_include_directories(test_periph PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+if(WIN32)
+  target_link_libraries(test_periph PRIVATE ole32 user32)
+else()
+  target_link_libraries(test_periph PRIVATE m Threads::Threads ${CMAKE_DL_LIBS})
+endif()
+if(MSVC)
+  target_compile_options(test_periph PRIVATE /O2 /W3 /UNDEBUG /experimental:c11atomics)
+else()
+  target_compile_options(test_periph PRIVATE -O2 -UNDEBUG -Wall -Wextra)
+endif()
+add_test(NAME test_periph COMMAND test_periph)
 
 # Windows D3D11 / DXGI / MediaFoundation GPU pipeline targets
 if(WIN32 AND NOT ZCRUDP_PORTABLE_CODEC)
@@ -412,9 +433,11 @@ if(WIN32 AND NOT ZCRUDP_PORTABLE_CODEC)
     src/stream_live.c
     src/gpu_pipeline_win32.c
     src/zcrudp_video_bridge.c
+    src/zc_periph.c
   )
 
   target_include_directories(zcrudp_stream PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
     "${ZCVID_DIR}/include"
     "${ZPSYNC_DIR}/include"
@@ -473,13 +496,14 @@ else()
     src/zcvid_zcrudp_bench.c
     src/gpu_pipeline_portable.c
     src/zcrudp_video_bridge.c
+    src/zc_periph.c
   )
   target_include_directories(zcrudp_zcvid_bench PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${ZCVID_DIR}/include"
   )
   if(WIN32)
-    target_link_libraries(zcrudp_zcvid_bench PRIVATE zcrudp_lib ws2_32 winmm)
+    target_link_libraries(zcrudp_zcvid_bench PRIVATE zcrudp_lib ws2_32 winmm ole32 user32)
   else()
     target_link_libraries(zcrudp_zcvid_bench PRIVATE zcrudp_lib m Threads::Threads ${CMAKE_DL_LIBS})
   endif()
@@ -494,6 +518,7 @@ else()
     src/stream_live.c
     src/gpu_pipeline_portable.c
     src/zcrudp_video_bridge.c
+    src/zc_periph.c
   )
   target_include_directories(zcrudp_stream PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -501,7 +526,7 @@ else()
     "${ZPSYNC_DIR}/include"
   )
   if(WIN32)
-    target_link_libraries(zcrudp_stream PRIVATE zcrudp_lib zpsync_lib ws2_32 winmm)
+    target_link_libraries(zcrudp_stream PRIVATE zcrudp_lib zpsync_lib ws2_32 winmm ole32 user32)
   else()
     target_link_libraries(zcrudp_stream PRIVATE zcrudp_lib zpsync_lib m Threads::Threads ${CMAKE_DL_LIBS})
   endif()

@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "zc_periph.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -153,6 +154,12 @@ int gpu_pipeline_decode_and_present(gpu_pipeline_t *pipe,
 
 /** Pumps Win32 window messages; returns false if user closed the window. */
 bool gpu_pipeline_pump_events(gpu_pipeline_t *pipe);
+
+typedef void (*gpu_input_cb_t)(const zc_input_event_t *ev, void *userdata);
+void gpu_pipeline_set_display_index(uint32_t display_idx);
+void gpu_pipeline_set_input_callback(gpu_pipeline_t *pipe, gpu_input_cb_t cb, void *userdata);
+void gpu_pipeline_set_mouse_relative(gpu_pipeline_t *pipe, bool relative);
+bool gpu_pipeline_get_mouse_relative(gpu_pipeline_t *pipe);
 
 /** Optional FILE* for mirroring GPU pipeline error logs to a log file. */
 void gpu_pipeline_set_log_file(void *stdio_file);
