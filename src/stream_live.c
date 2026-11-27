@@ -467,17 +467,25 @@ static void sender_poll_ctrl(sender_ctrl_t *c) {
       uint32_t caps = 0;
       if (clen >= 12) memcpy(&caps, cbuf + 8, 4);
       if (caps != c->peer_caps) {
+        uint32_t downgraded = c->peer_caps & ~caps;
         c->peer_caps = caps;
         gpu_pipeline_zcvid_set_qpel(c->gpu, (caps & 1U) != 0U);
         gpu_pipeline_zcvid_set_transform(c->gpu, (caps & 2U) != 0U);
         gpu_pipeline_zcvid_set_transform_inter(c->gpu, (caps & 2U) != 0U);
+        gpu_pipeline_zcvid_set_dct8(c->gpu, (caps & 8U) != 0U);
         /* Legacy receivers with bit 1 (transform) but without bit 2 (CABAC v3/v4)
          * still decode plain-packed class 8 cleanly when entropy coding is off. */
         bool allow_ec = ((caps & 2U) == 0U) || ((caps & 4U) != 0U);
         gpu_pipeline_zcvid_set_entropy(c->gpu, allow_ec);
-        printf("[SENDER] receiver decodes quarter-pel: %s, transform: %s, tq-ec-v3: %s\n",
+        if (downgraded != 0U) {
+          /* Any prior frames sent using a capability the peer lacks (e.g. DCT8 v4
+           * to a legacy v3 peer) were rejected; force an immediate clean keyframe. */
+          c->resync_kf_frames = 4U;
+          gpu_pipeline_zcvid_request_keyframe(c->gpu);
+        }
+        printf("[SENDER] receiver decodes quarter-pel: %s, transform: %s, tq-ec-v3: %s, dct8-v4: %s\n",
                (caps & 1U) ? "on" : "off", (caps & 2U) ? "on" : "off",
-               (caps & 4U) ? "on" : "off");
+               (caps & 4U) ? "on" : "off", (caps & 8U) ? "on" : "off");
         fflush(stdout);
       }
       if (!c->peer_reads_ec) {
@@ -703,10 +711,10 @@ static int run_sender(stream_codec_t codec, const char *host, uint16_t port,
   ctl.codec = codec;
   ctl.apply_impair = apply_impair;
   ctl.use_connected_sock = zp_active;
-  /* Unified Zcvid defaults: EC, quarter-pel MVs, and 4x4 transform RDO are
+  /* Unified Zcvid defaults: EC, quarter-pel MVs, 4x4/8x8 DCT8 transform RDO are
    * active from frame 0; a legacy peer announcing fewer ZCEC caps downgrades cleanly. */
   ctl.peer_reads_ec = (codec == CODEC_ZCVID);
-  ctl.peer_caps = (codec == CODEC_ZCVID) ? (1U | 2U | 4U) : 0U;
+  ctl.peer_caps = (codec == CODEC_ZCVID) ? (1U | 2U | 4U | 8U) : 0U;
   /* Parity only once losses show up (see sender_note_loss). */
   ctl.fec_cfg = tx->fec_shards;
   tx->fec_shards = 0U;
@@ -1255,7 +1263,7 @@ static int run_receiver(stream_codec_t codec, uint16_t port, uint32_t width,
         if (last_caps_us == 0 || now_ctl - last_caps_us >= 1000000ULL) {
           uint8_t caps[12];
           uint32_t budget = gpu_pipeline_zcvid_entropy_budget(gpu);
-          uint32_t features = 1U | 2U | 4U; /* quarter-pel, transform, CABAC v3/v4 */
+          uint32_t features = 1U | 2U | 4U | 8U; /* quarter-pel, transform, CABAC v3, DCT8 v4 */
           memcpy(caps, "ZCEC", 4);
           memcpy(caps + 4, &budget, 4);
           memcpy(caps + 8, &features, 4);

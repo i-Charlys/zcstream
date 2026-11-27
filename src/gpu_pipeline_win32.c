@@ -301,6 +301,7 @@ struct gpu_pipeline_s {
   bool zcvid_intra8;             /* rolling refresh in 8-bit 2-px intra (budget to spare) */
   bool zcvid_tq;                 /* transform intra on 4x4 blocks (CSIntraT / CSITrans) */
   bool zcvid_tq_inter;           /* ... and transform-coded motion residual */
+  bool zcvid_dct8;               /* exact 12-mul factored 8x8 HEVC DCT8 (pred 4/5, CABAC v4) */
   bool zcvid_qpel;               /* tile vectors in quarter pels (wide +-60 px range) */
   bool zcvid_dither;             /* ordered dither on the 6-bit rolling intra */
   uint32_t zcvid_tq_qp;          /* transform qp, its own rate loop (ZCVID_TQ_ADAPTIVE) */
@@ -1262,7 +1263,8 @@ typedef struct {
 #define ZCVID_WIDE_MV_FLAG 0x08000000U /* MVs use int16 (wide +-63.75 px quarter-pel) */
 #define ZCVID_EC_MV_FLAG 0x04000000U   /* MVs are median-DPCM + range coded */
 #define ZCVID_TQ_V3_FLAG 0x02000000U   /* Class-8 CABAC superblock + intra DC DPCM */
-#define ZCVID_RECORD_WORDS_MASK 0x01FFFFFFU
+#define ZCVID_TQ_V4_FLAG 0x01000000U   /* Class-8 exact 8x8 DCT8 (pred 4/5) + CABAC v4 CSBF/ESR */
+#define ZCVID_RECORD_WORDS_MASK 0x00FFFFFFU
 /* Packed layouts carry 9 record classes (class 8: transform intra
  * coefficients) instead of 8. Only set when that class is in use, so a
  * stream without it stays readable by decoders that predate it. */
@@ -1694,7 +1696,7 @@ static const uint64_t *zcvid_sort_records(gpu_pipeline_t *p, const uint32_t *rec
 
 /* Packs the records of sorted keys a[0 .. num). */
 static size_t zcvid_pack_sorted(const uint32_t *rec, const uint64_t *a, uint32_t num,
-                               uint32_t ncls, uint8_t *out) {
+                               uint32_t ncls, uint8_t *out, bool tq_v4) {
   uint32_t counts[ZCVID_CLASSES_MAX] = {0};
   for (uint32_t n = 0; n < num; ++n) counts[a[n] >> 60]++;
 
@@ -1719,6 +1721,9 @@ static size_t zcvid_pack_sorted(const uint32_t *rec, const uint64_t *a, uint32_t
       } else if (cls == 7U) {
         uint64_t v = ((uint64_t)(w1 & 0x3FFFFFFFU) << 6) | ((w0 >> 22) & 0x3FU);
         for (unsigned k = 0; k < 5U; ++k) *o++ = (uint8_t)(v >> (8U * k));
+      } else if (tq_v4) { /* v4: full 32-bit w1 (level 16b + qp 8b + pred 8b for pred 0..5) */
+        memcpy(o, &w1, 4);
+        o += 4;
       } else { /* level (16 bits), qp (6 bits) and pred (2 bits: 0..3, 4x4/8x8 intra/inter) */
         *o++ = (uint8_t)w1;
         *o++ = (uint8_t)(w1 >> 8);
@@ -1734,13 +1739,13 @@ static size_t zcvid_pack_records(gpu_pipeline_t *p, const uint32_t *rec,
   uint32_t counts[ZCVID_CLASSES_MAX];
   const uint64_t *a = zcvid_sort_records(p, rec, &num_records, counts, false);
   if (!a) return 0;
-  return zcvid_pack_sorted(rec, a, num_records, p->zcvid_ncls, out);
+  return zcvid_pack_sorted(rec, a, num_records, p->zcvid_ncls, out, p->zcvid_tq && p->zcvid_dct8);
 }
 
 /* Expands a packed record stream back to 2 words per record. Returns the word
  * count, or UINT32_MAX on a malformed stream. */
 static uint32_t zcvid_unpack_records(const uint8_t *in, size_t in_len, uint32_t *out,
-                                    uint32_t max_words, uint32_t ncls) {
+                                    uint32_t max_words, uint32_t ncls, bool tq_v4) {
   const uint8_t *i = in, *end = in + in_len;
   uint32_t words = 0;
   for (uint32_t cls = 0; cls < ncls; ++cls) {
@@ -1771,6 +1776,11 @@ static uint32_t zcvid_unpack_records(const uint8_t *in, size_t in_len, uint32_t 
         i += 5;
         w0 = 0xE0000000U | ((uint32_t)(v & 0x3FU) << 22) | (id & 0x3FFFFFU);
         w1 = (uint32_t)(v >> 6) & 0x3FFFFFFFU;
+      } else if (tq_v4) {
+        if (end - i < 4) return UINT32_MAX;
+        w0 = 0xF0000000U | (id & 0x0FFFFFFFU);
+        memcpy(&w1, i, 4);
+        i += 4;
       } else {
         if (end - i < 3) return UINT32_MAX;
         w0 = 0xF0000000U | (id & 0x0FFFFFFFU);
@@ -2254,6 +2264,15 @@ typedef struct {
   zcrudp_rc_prob_t gt1[2][2][4];       /* [is_inter][chroma][kb=0..3] */
   zcrudp_rc_prob_t gt2[2][2][4];       /* [is_inter][chroma][kb=0..3] */
   zcrudp_rc_prob_t mag_rem[2][4][7];   /* [chroma][kb=0..3][egk_ctx] */
+  /* CABAC v4 exact 8x8 DCT8 CSBF + degree-2 polynomial fast-path contexts */
+  zcrudp_rc_prob_t dct8_ll_only[2];
+  zcrudp_rc_prob_t dct8_poly_only[2];
+  zcrudp_rc_prob_t dct8_poly_last[2][4];
+  zcrudp_rc_prob_t dct8_poly_sig[2][5];
+  zcrudp_rc_prob_t dct8_csbf[2][4];
+  zcrudp_rc_prob_t dct8_hf_has_ac[2];
+  zcrudp_rc_prob_t dct8_hf_last_k[2][14];
+  zcrudp_rc_prob_t dct8_hf_sig[2][15];
 } zcvid_tq_model_t;
 
 typedef struct {
@@ -2261,6 +2280,8 @@ typedef struct {
   uint32_t alt_qp[2];
   int32_t  prev_intra_dc[3];
   uint32_t prev_intra_qp[3];
+  int32_t  prev_dct8_dc[3];
+  uint32_t prev_dct8_qp[3];
 } zcvid_tq_state_t;
 
 static void zcvid_tq_state_reset(zcvid_tq_state_t *st) {
@@ -2268,6 +2289,8 @@ static void zcvid_tq_state_reset(zcvid_tq_state_t *st) {
   st->alt_qp[0]  = st->alt_qp[1]  = 64U;
   st->prev_intra_dc[0] = st->prev_intra_dc[1] = st->prev_intra_dc[2] = 0;
   st->prev_intra_qp[0] = st->prev_intra_qp[1] = st->prev_intra_qp[2] = 64U;
+  st->prev_dct8_dc[0]  = st->prev_dct8_dc[1]  = st->prev_dct8_dc[2]  = 0;
+  st->prev_dct8_qp[0]  = st->prev_dct8_qp[1]  = st->prev_dct8_qp[2]  = 64U;
 }
 
 static zcvid_tq_model_t g_tq_model_tpl;
@@ -2313,6 +2336,17 @@ static void zcvid_tq_model_reset(zcvid_tq_model_t *m) {
             zcrudp_rc_prob_init(&t->mag_rem[i][kb][c], (uint16_t)p0);
           }
         }
+        zcrudp_rc_prob_init(&t->dct8_ll_only[i], (i == 0) ? 10000U : 4000U);
+        zcrudp_rc_prob_init(&t->dct8_poly_only[i], (i == 0) ? 14000U : 8000U);
+        for (int c = 0; c < 4; ++c) zcrudp_rc_prob_init(&t->dct8_poly_last[i][c], 16384U);
+        for (int k = 0; k < 5; ++k) zcrudp_rc_prob_init(&t->dct8_poly_sig[i][k], (k == 0) ? 8000U : 15000U);
+        zcrudp_rc_prob_init(&t->dct8_csbf[i][0], 5000U);
+        zcrudp_rc_prob_init(&t->dct8_csbf[i][1], 18000U);
+        zcrudp_rc_prob_init(&t->dct8_csbf[i][2], 18000U);
+        zcrudp_rc_prob_init(&t->dct8_csbf[i][3], 24000U);
+        zcrudp_rc_prob_init(&t->dct8_hf_has_ac[i], 14000U);
+        for (int c = 0; c < 14; ++c) zcrudp_rc_prob_init(&t->dct8_hf_last_k[i][c], 16384U);
+        for (int k = 0; k < 15; ++k) zcrudp_rc_prob_init(&t->dct8_hf_sig[i][k], (k < 4) ? 16000U : 22000U);
       }
       InterlockedExchange(&g_tq_model_tpl_state, 2);
     } else {
@@ -2459,11 +2493,194 @@ static inline bool zcvid_tq_put_block(zcrudp_rc_enc_t * __restrict rc,
   return !lrc.overflow;
 }
 
+static inline bool zcvid_tq_put_dct8_sb(zcrudp_rc_enc_t * __restrict rc,
+                                        zcvid_tq_model_t * __restrict m,
+                                        zcvid_tq_state_t * __restrict st,
+                                        const uint64_t * __restrict keys,
+                                        uint32_t i, uint32_t se,
+                                        uint32_t sb_lo) {
+  uint32_t pred = ((uint32_t)keys[i] >> 24) & 0xFFU;
+  if (pred != 4U && pred != 5U) return false;
+  uint32_t is_inter = pred & 1U;
+
+  int16_t lv[3][4][16];
+  uint16_t sig[3][4];
+  uint8_t csbf[3] = {0, 0, 0};
+  uint32_t pl_qp[3] = {64U, 64U, 64U};
+  uint32_t pmask = 0U;
+  memset(sig, 0, sizeof(sig));
+
+  for (uint32_t t = i; t < se; ++t) {
+    uint64_t kv = keys[t];
+    uint32_t w1 = (uint32_t)kv;
+    uint32_t id = (uint32_t)(kv >> 32) & 0x0FFFFFFFU;
+    if (id < sb_lo || id >= sb_lo + 192U) return false;
+    uint32_t rel = id - sb_lo;
+    uint32_t q = rel / 48U;
+    uint32_t rem = rel - q * 48U;
+    uint32_t pl = rem >> 4;
+    uint32_t k = rem & 15U;
+    uint32_t rqp = (w1 >> 16) & 0xFFU;
+    uint32_t rpred = (w1 >> 24) & 0xFFU;
+    int32_t level = (int32_t)(int16_t)(w1 & 0xFFFFU);
+    if (rpred != pred || rqp > 51U || level < -2047 || level > 2047) return false;
+    if ((q > 0U || k > 0U || is_inter != 0U) && level == 0) return false;
+    if ((sig[pl][q] & (1U << k)) != 0U) return false;
+    if (((pmask >> pl) & 1U) != 0U) {
+      if (pl_qp[pl] != rqp) return false;
+    } else {
+      pl_qp[pl] = rqp;
+      pmask |= (1U << pl);
+    }
+    lv[pl][q][k] = (int16_t)level;
+    sig[pl][q] |= (uint16_t)(1U << k);
+    csbf[pl] |= (uint8_t)(1U << q);
+  }
+  if (pmask == 0U) return false;
+
+  zcrudp_rc_enc_t lrc = *rc;
+  zcrudp_rc_enc_bit(&lrc, &m->pred[1], is_inter);
+  uint32_t py = pmask & 1U;
+  uint32_t pb = (pmask >> 1) & 1U;
+  uint32_t pr = (pmask >> 2) & 1U;
+  zcrudp_rc_enc_bit(&lrc, &m->present[0], py);
+  zcrudp_rc_enc_bit(&lrc, &m->present[1], pb);
+  if ((py | pb) != 0U) zcrudp_rc_enc_bit(&lrc, &m->present[2U + pb], pr);
+
+  for (uint32_t pl = 0U; pl < 3U; ++pl) {
+    if (((pmask >> pl) & 1U) == 0U) continue;
+    uint32_t chroma = (pl > 0U) ? 1U : 0U;
+    uint32_t qp = pl_qp[pl];
+    if (qp == st->last_qp[chroma]) {
+      zcrudp_rc_enc_bit(&lrc, &m->qp_same[chroma], 0U);
+    } else {
+      zcrudp_rc_enc_bit(&lrc, &m->qp_same[chroma], 1U);
+      if (qp == st->alt_qp[chroma]) {
+        zcrudp_rc_enc_bit(&lrc, &m->qp_is_alt[chroma], 1U);
+        st->alt_qp[chroma] = st->last_qp[chroma];
+        st->last_qp[chroma] = qp;
+      } else {
+        zcrudp_rc_enc_bit(&lrc, &m->qp_is_alt[chroma], 0U);
+        zcrudp_rc_enc_direct(&lrc, qp, 6U);
+        st->alt_qp[chroma] = st->last_qp[chroma];
+        st->last_qp[chroma] = qp;
+      }
+    }
+
+    uint32_t cm = csbf[pl];
+    uint32_t ll_only = (cm == 1U) ? 1U : 0U;
+    zcrudp_rc_enc_bit(&lrc, &m->dct8_ll_only[chroma], ll_only);
+    if (!ll_only) {
+      uint32_t b0 = cm & 1U;
+      uint32_t b1 = (cm >> 1) & 1U;
+      uint32_t b2 = (cm >> 2) & 1U;
+      uint32_t b3 = (cm >> 3) & 1U;
+      zcrudp_rc_enc_bit(&lrc, &m->dct8_csbf[chroma][0], b0);
+      zcrudp_rc_enc_bit(&lrc, &m->dct8_csbf[chroma][1], b1);
+      zcrudp_rc_enc_bit(&lrc, &m->dct8_csbf[chroma][2], b2);
+      if ((b1 | b2) != 0U) zcrudp_rc_enc_bit(&lrc, &m->dct8_csbf[chroma][3], b3);
+    }
+
+    if (is_inter == 0U && ((sig[pl][0] & 1U) == 0U)) {
+      st->prev_dct8_dc[pl] = 0;
+      st->prev_dct8_qp[pl] = qp;
+    }
+
+    for (uint32_t q = 0U; q < 4U; ++q) {
+      if (((cm >> q) & 1U) == 0U) continue;
+      uint32_t sm = sig[pl][q];
+      uint32_t last_k = 0U;
+      for (uint32_t tmp_m = sm; tmp_m > 1U; tmp_m >>= 1) last_k++;
+
+      uint32_t poly_only = 0U;
+      if (ll_only) {
+        poly_only = ((sm & ~0x3FU) == 0U) ? 1U : 0U;
+        zcrudp_rc_enc_bit(&lrc, &m->dct8_poly_only[chroma], poly_only);
+      }
+
+      uint32_t has_ac = (last_k > 0U) ? 1U : 0U;
+      if (poly_only) {
+        zcrudp_rc_enc_bit(&lrc, &m->has_ac[is_inter][chroma], has_ac);
+        if (has_ac) {
+          uint32_t v = last_k - 1U; /* 0..4 */
+          uint32_t ge2 = (v >= 2U) ? 1U : 0U;
+          zcrudp_rc_enc_bit(&lrc, &m->dct8_poly_last[chroma][0], ge2);
+          if (!ge2) {
+            zcrudp_rc_enc_bit(&lrc, &m->dct8_poly_last[chroma][1], v & 1U);
+          } else {
+            uint32_t is4 = (v == 4U) ? 1U : 0U;
+            zcrudp_rc_enc_bit(&lrc, &m->dct8_poly_last[chroma][2], is4);
+            if (!is4) zcrudp_rc_enc_bit(&lrc, &m->dct8_poly_last[chroma][3], v - 2U);
+          }
+          for (uint32_t k = 0U; k < last_k; ++k) {
+            zcrudp_rc_enc_bit(&lrc, &m->dct8_poly_sig[chroma][k], (sm >> k) & 1U);
+          }
+        }
+      } else {
+        zcrudp_rc_prob_t *hac = (q == 0U) ? &m->has_ac[is_inter][chroma] : &m->dct8_hf_has_ac[chroma];
+        zcrudp_rc_prob_t *lk  = (q == 0U) ? m->last_k[is_inter][chroma]  : m->dct8_hf_last_k[chroma];
+        zcrudp_rc_prob_t *sp  = (q == 0U) ? m->sig[is_inter][chroma]     : m->dct8_hf_sig[chroma];
+        zcrudp_rc_enc_bit(&lrc, hac, has_ac);
+        if (has_ac) {
+          uint32_t v = last_k - 1U;
+          uint32_t b3 = (v >> 3) & 1U; zcrudp_rc_enc_bit(&lrc, &lk[0], b3);
+          uint32_t n2 = 2U | b3;
+          uint32_t b2 = (v >> 2) & 1U; zcrudp_rc_enc_bit(&lrc, &lk[n2 - 1U], b2);
+          uint32_t n1 = (n2 << 1) | b2;
+          uint32_t b1 = (v >> 1) & 1U; zcrudp_rc_enc_bit(&lrc, &lk[n1 - 1U], b1);
+          uint32_t n0 = (n1 << 1) | b1;
+          if (n0 != 15U) zcrudp_rc_enc_bit(&lrc, &lk[n0 - 1U], v & 1U);
+          for (uint32_t k = 0U; k < last_k; ++k) {
+            zcrudp_rc_enc_bit(&lrc, &sp[k], (sm >> k) & 1U);
+          }
+        }
+      }
+
+      uint32_t sm_it = sm;
+      while (sm_it != 0U) {
+        uint32_t k = zcvid_ctz32(sm_it);
+        sm_it &= sm_it - 1U;
+        int32_t val = lv[pl][q][k];
+        uint32_t egk_max = 11U;
+        if (q == 0U && k == 0U && is_inter == 0U) {
+          int32_t pred_dc = (qp == st->prev_dct8_qp[pl]) ? st->prev_dct8_dc[pl] : 0;
+          st->prev_dct8_dc[pl] = val;
+          st->prev_dct8_qp[pl] = qp;
+          val -= pred_dc;
+          uint32_t nz = (val != 0) ? 1U : 0U;
+          zcrudp_rc_enc_bit(&lrc, &m->intra_dc_nz[chroma], nz);
+          if (!nz) continue;
+          egk_max = 12U;
+        }
+        uint32_t neg = (val < 0) ? 1U : 0U;
+        if (q == 0U && k == 0U) {
+          zcrudp_rc_enc_bit(&lrc, &m->dc_sign[is_inter][chroma], neg);
+        } else {
+          zcrudp_rc_enc_bit_bypass(&lrc, neg);
+        }
+        uint32_t mag = (uint32_t)(neg ? -val : val);
+        uint32_t kb = (q == 0U) ? zcvid_tq_kb(k) : 3U;
+        uint32_t gt1 = (mag > 1U) ? 1U : 0U;
+        zcrudp_rc_enc_bit(&lrc, &m->gt1[is_inter][chroma][kb], gt1);
+        if (gt1) {
+          uint32_t gt2 = (mag > 2U) ? 1U : 0U;
+          zcrudp_rc_enc_bit(&lrc, &m->gt2[is_inter][chroma][kb], gt2);
+          if (gt2) {
+            zcrudp_rc_enc_egk(&lrc, m->mag_rem[chroma][kb], 7U, egk_max, (uint64_t)(mag - 3U));
+          }
+        }
+      }
+    }
+  }
+  *rc = lrc;
+  return !lrc.overflow;
+}
+
 /* Codes keys[0 .. num) (all class 8, sorted in 8x8 superblock order).
  * Returns false when the records break the layout (caller falls back to plain). */
 static bool zcvid_tq_put(zcrudp_rc_enc_t * __restrict rc, zcrudp_tec_model_t * __restrict tm,
                         const uint64_t * __restrict keys,
-                        uint32_t num, uint32_t bw, uint32_t bh) {
+                        uint32_t num, uint32_t bw, uint32_t bh, bool tq_v4) {
   zcvid_tq_model_t m;
   zcvid_tq_model_reset(&m);
   zcvid_tq_state_t st;
@@ -2490,15 +2707,25 @@ static bool zcvid_tq_put(zcrudp_rc_enc_t * __restrict rc, zcrudp_tec_model_t * _
     while (se < num && (((uint32_t)(keys[se] >> 32) & 0x0FFFFFFFU) < sb_hi)) se++;
 
     uint32_t pred0 = ((uint32_t)keys[i] >> 24) & 0xFFU;
-    if (pred0 > 3U) return false;
-    uint32_t is_8x8 = (pred0 >> 1) & 1U;
+    uint32_t is_8x8 = 0U;
+    if (tq_v4) {
+      if (pred0 == 4U || pred0 == 5U) is_8x8 = 1U;
+      else if (pred0 > 1U) return false;
+    } else {
+      if (pred0 > 3U) return false;
+      is_8x8 = (pred0 >> 1) & 1U;
+    }
     zcrudp_rc_enc_bit(rc, &m.is_8x8, is_8x8);
 
     if (is_8x8) {
-      /* Verify all records in this 8x8 superblock are anchored at quadrant 0. */
-      uint32_t q0_last = ((uint32_t)(keys[se - 1U] >> 32) & 0x0FFFFFFFU) - sb_lo;
-      if (q0_last >= 48U) return false;
-      if (!zcvid_tq_put_block(rc, &m, &st, keys, i, se, sb_lo, 1U)) return false;
+      if (tq_v4) {
+        if (!zcvid_tq_put_dct8_sb(rc, &m, &st, keys, i, se, sb_lo)) return false;
+      } else {
+        /* Verify all records in this 8x8 superblock are anchored at quadrant 0. */
+        uint32_t q0_last = ((uint32_t)(keys[se - 1U] >> 32) & 0x0FFFFFFFU) - sb_lo;
+        if (q0_last >= 48U) return false;
+        if (!zcvid_tq_put_block(rc, &m, &st, keys, i, se, sb_lo, 1U)) return false;
+      }
     } else {
       uint32_t q_beg[4], q_end[4];
       uint32_t j = i;
@@ -2635,10 +2862,167 @@ static inline bool zcvid_tq_get_block(zcrudp_rc_dec_t * __restrict rc,
   return true;
 }
 
+static inline bool zcvid_tq_get_dct8_sb(zcrudp_rc_dec_t * __restrict rc,
+                                        zcvid_tq_model_t * __restrict m,
+                                        zcvid_tq_state_t * __restrict st,
+                                        uint32_t sbx, uint32_t sby,
+                                        uint32_t bw, uint32_t bh,
+                                        uint32_t count,
+                                        uint32_t * __restrict got_io,
+                                        uint32_t * __restrict out) {
+  uint32_t bx0 = sbx * 2U;
+  uint32_t by0 = sby * 2U;
+  if (bx0 + 1U >= bw || by0 + 1U >= bh) return false;
+
+  zcrudp_rc_dec_t lrc = *rc;
+  uint32_t is_inter = zcrudp_rc_dec_bit(&lrc, &m->pred[1]);
+  uint32_t pred = 4U | is_inter;
+  uint32_t py = zcrudp_rc_dec_bit(&lrc, &m->present[0]);
+  uint32_t pb = zcrudp_rc_dec_bit(&lrc, &m->present[1]);
+  uint32_t pr = ((py | pb) != 0U) ? zcrudp_rc_dec_bit(&lrc, &m->present[2U + pb]) : 1U;
+  uint32_t pmask = py | (pb << 1) | (pr << 2);
+  uint32_t got = *got_io;
+  uint32_t bq[4] = {
+      by0 * bw + bx0,
+      by0 * bw + (bx0 + 1U),
+      (by0 + 1U) * bw + bx0,
+      (by0 + 1U) * bw + (bx0 + 1U)
+  };
+
+  for (uint32_t pl = 0U; pl < 3U; ++pl) {
+    if (((pmask >> pl) & 1U) == 0U) continue;
+    uint32_t chroma = (pl > 0U) ? 1U : 0U;
+    if (zcrudp_rc_dec_bit(&lrc, &m->qp_same[chroma]) != 0U) {
+      if (zcrudp_rc_dec_bit(&lrc, &m->qp_is_alt[chroma]) != 0U) {
+        uint32_t tmp = st->last_qp[chroma];
+        st->last_qp[chroma] = st->alt_qp[chroma];
+        st->alt_qp[chroma] = tmp;
+      } else {
+        uint32_t nqp = (uint32_t)zcrudp_rc_dec_direct(&lrc, 6U);
+        st->alt_qp[chroma] = st->last_qp[chroma];
+        st->last_qp[chroma] = nqp;
+      }
+    }
+    uint32_t qp = st->last_qp[chroma];
+    if (qp > 51U) { *rc = lrc; return false; }
+
+    uint32_t ll_only = zcrudp_rc_dec_bit(&lrc, &m->dct8_ll_only[chroma]);
+    uint32_t cm = 1U;
+    if (!ll_only) {
+      uint32_t b0 = zcrudp_rc_dec_bit(&lrc, &m->dct8_csbf[chroma][0]);
+      uint32_t b1 = zcrudp_rc_dec_bit(&lrc, &m->dct8_csbf[chroma][1]);
+      uint32_t b2 = zcrudp_rc_dec_bit(&lrc, &m->dct8_csbf[chroma][2]);
+      uint32_t b3 = ((b1 | b2) != 0U) ? zcrudp_rc_dec_bit(&lrc, &m->dct8_csbf[chroma][3]) : 1U;
+      cm = b0 | (b1 << 1) | (b2 << 2) | (b3 << 3);
+    }
+
+    if (is_inter == 0U && (cm & 1U) == 0U) {
+      st->prev_dct8_dc[pl] = 0;
+      st->prev_dct8_qp[pl] = qp;
+    }
+
+    uint32_t w1_hi = (qp << 16) | (pred << 24);
+    for (uint32_t q = 0U; q < 4U; ++q) {
+      if (((cm >> q) & 1U) == 0U) continue;
+      uint32_t poly_only = 0U;
+      if (ll_only) {
+        poly_only = zcrudp_rc_dec_bit(&lrc, &m->dct8_poly_only[chroma]);
+      }
+      uint32_t sig_mask = 1U;
+      if (poly_only) {
+        if (zcrudp_rc_dec_bit(&lrc, &m->has_ac[is_inter][chroma]) != 0U) {
+          uint32_t last_k;
+          if (zcrudp_rc_dec_bit(&lrc, &m->dct8_poly_last[chroma][0]) == 0U) {
+            last_k = 1U + zcrudp_rc_dec_bit(&lrc, &m->dct8_poly_last[chroma][1]);
+          } else if (zcrudp_rc_dec_bit(&lrc, &m->dct8_poly_last[chroma][2]) != 0U) {
+            last_k = 5U;
+          } else {
+            last_k = 3U + zcrudp_rc_dec_bit(&lrc, &m->dct8_poly_last[chroma][3]);
+          }
+          sig_mask = 1U << last_k;
+          for (uint32_t k = 0U; k < last_k; ++k) {
+            sig_mask |= zcrudp_rc_dec_bit(&lrc, &m->dct8_poly_sig[chroma][k]) << k;
+          }
+        }
+      } else {
+        zcrudp_rc_prob_t *hac = (q == 0U) ? &m->has_ac[is_inter][chroma] : &m->dct8_hf_has_ac[chroma];
+        zcrudp_rc_prob_t *lk  = (q == 0U) ? m->last_k[is_inter][chroma]  : m->dct8_hf_last_k[chroma];
+        zcrudp_rc_prob_t *sp  = (q == 0U) ? m->sig[is_inter][chroma]     : m->dct8_hf_sig[chroma];
+        if (zcrudp_rc_dec_bit(&lrc, hac) != 0U) {
+          uint32_t node = 2U | zcrudp_rc_dec_bit(&lrc, &lk[0]);
+          node = (node << 1) | zcrudp_rc_dec_bit(&lrc, &lk[node - 1U]);
+          node = (node << 1) | zcrudp_rc_dec_bit(&lrc, &lk[node - 1U]);
+          node = (node == 15U) ? 30U : ((node << 1) | zcrudp_rc_dec_bit(&lrc, &lk[node - 1U]));
+          uint32_t last_k = node - 15U;
+          sig_mask = 1U << last_k;
+          for (uint32_t k = 0U; k < last_k; ++k) {
+            sig_mask |= zcrudp_rc_dec_bit(&lrc, &sp[k]) << k;
+          }
+        }
+      }
+      if (zcvid_popcount32(sig_mask) > count - got) { *rc = lrc; return false; }
+
+      if (q == 0U && is_inter == 0U && (sig_mask & 1U) == 0U) {
+        st->prev_dct8_dc[pl] = 0;
+        st->prev_dct8_qp[pl] = qp;
+      }
+
+      uint32_t w0_base = 0xF0000000U | (bq[q] * 48U + pl * 16U);
+      uint32_t sm = sig_mask;
+      while (sm != 0U) {
+        uint32_t k = zcvid_ctz32(sm);
+        sm &= sm - 1U;
+        int32_t level = 0;
+        if (q == 0U && k == 0U && is_inter == 0U) {
+          int32_t pred_dc = (qp == st->prev_dct8_qp[pl]) ? st->prev_dct8_dc[pl] : 0;
+          int32_t val = 0;
+          if (zcrudp_rc_dec_bit(&lrc, &m->intra_dc_nz[chroma]) != 0U) {
+            uint32_t neg = zcrudp_rc_dec_bit(&lrc, &m->dc_sign[0][chroma]);
+            int32_t mag = 1;
+            if (zcrudp_rc_dec_bit(&lrc, &m->gt1[0][chroma][0]) != 0U) {
+              mag = 2;
+              if (zcrudp_rc_dec_bit(&lrc, &m->gt2[0][chroma][0]) != 0U) {
+                mag = (int32_t)zcrudp_rc_dec_egk(&lrc, m->mag_rem[chroma][0], 7U, 12U) + 3;
+                if (mag > 4094) { *rc = lrc; return false; }
+              }
+            }
+            val = neg ? -mag : mag;
+          }
+          level = pred_dc + val;
+          if (level < -2047 || level > 2047) { *rc = lrc; return false; }
+          st->prev_dct8_dc[pl] = level;
+          st->prev_dct8_qp[pl] = qp;
+        } else {
+          uint32_t neg = (q == 0U && k == 0U)
+                             ? zcrudp_rc_dec_bit(&lrc, &m->dc_sign[is_inter][chroma])
+                             : zcrudp_rc_dec_bit_bypass(&lrc);
+          uint32_t kb = (q == 0U) ? zcvid_tq_kb(k) : 3U;
+          int32_t mag = 1;
+          if (zcrudp_rc_dec_bit(&lrc, &m->gt1[is_inter][chroma][kb]) != 0U) {
+            mag = 2;
+            if (zcrudp_rc_dec_bit(&lrc, &m->gt2[is_inter][chroma][kb]) != 0U) {
+              mag = (int32_t)zcrudp_rc_dec_egk(&lrc, m->mag_rem[chroma][kb], 7U, 11U) + 3;
+              if (mag > 2047) { *rc = lrc; return false; }
+            }
+          }
+          level = neg ? -mag : mag;
+        }
+        out[got * 2U] = w0_base + k;
+        out[got * 2U + 1U] = ((uint32_t)level & 0xFFFFU) | w1_hi;
+        got++;
+      }
+    }
+  }
+  *rc = lrc;
+  *got_io = got;
+  return true;
+}
+
 /* Decodes count records into out (2 words each). Returns false on a
  * malformed stream. */
 static bool zcvid_tq_get(zcrudp_rc_dec_t * __restrict rc, zcrudp_tec_model_t * __restrict tm,
-                        uint32_t count, uint32_t * __restrict out, uint32_t bw, uint32_t bh) {
+                        uint32_t count, uint32_t * __restrict out, uint32_t bw, uint32_t bh,
+                        bool tq_v4) {
   zcvid_tq_model_t m;
   zcvid_tq_model_reset(&m);
   zcvid_tq_state_t st;
@@ -2677,9 +3061,16 @@ static bool zcvid_tq_get(zcrudp_rc_dec_t * __restrict rc, zcrudp_tec_model_t * _
 
     uint32_t is_8x8 = zcrudp_rc_dec_bit(&lrc, &m.is_8x8);
     if (is_8x8) {
-      uint32_t bx = sbx * 2U, by = sby * 2U;
-      if (bx >= bw || by >= bh) { *rc = lrc; return false; }
-      if (!zcvid_tq_get_block(&lrc, &m, &st, by * bw + bx, 1U, count, &got, out)) { *rc = lrc; return false; }
+      if (tq_v4) {
+        if (!zcvid_tq_get_dct8_sb(&lrc, &m, &st, sbx, sby, bw, bh, count, &got, out)) {
+          *rc = lrc;
+          return false;
+        }
+      } else {
+        uint32_t bx = sbx * 2U, by = sby * 2U;
+        if (bx >= bw || by >= bh) { *rc = lrc; return false; }
+        if (!zcvid_tq_get_block(&lrc, &m, &st, by * bw + bx, 1U, count, &got, out)) { *rc = lrc; return false; }
+      }
     } else {
       uint32_t b0 = zcrudp_rc_dec_bit(&lrc, &m.qmask[0]);
       uint32_t b1 = zcrudp_rc_dec_bit(&lrc, &m.qmask[1U + b0]);
@@ -2702,7 +3093,7 @@ static bool zcvid_tq_get(zcrudp_rc_dec_t * __restrict rc, zcrudp_tec_model_t * _
 static size_t zcvid_ec_put_chunk(gpu_pipeline_t * __restrict p, uint32_t slot,
                                 const uint32_t * __restrict rec,
                                 const uint64_t * __restrict keys, uint32_t num, uint32_t ncls,
-                                uint8_t * __restrict out, size_t out_cap) {
+                                bool tq_v4, uint8_t * __restrict out, size_t out_cap) {
   zcrudp_tec_model_t *tm = (zcrudp_tec_model_t *)p->zcvid_ec_model[slot];
   const uint32_t num_px = p->width * p->height;
   uint32_t counts[ZCVID_CLASSES_MAX] = {0};
@@ -2721,7 +3112,7 @@ static size_t zcvid_ec_put_chunk(gpu_pipeline_t * __restrict p, uint32_t slot,
     } else if (cls == 8U) {
       zcrudp_tec_run_reset(tm);
       if (!zcvid_tq_put(&rc, tm, keys + i, counts[cls],
-                       (p->width + 3U) >> 2, (p->height + 3U) >> 2)) return 0;
+                       (p->width + 3U) >> 2, (p->height + 3U) >> 2, tq_v4)) return 0;
       i += counts[cls];
       continue;
     } else {
@@ -2801,7 +3192,7 @@ static size_t zcvid_ec_put_chunk(gpu_pipeline_t * __restrict p, uint32_t slot,
 static uint32_t zcvid_ec_get_chunk(gpu_pipeline_t * __restrict p, uint32_t slot,
                                   const uint8_t * __restrict in,
                                   size_t in_len, uint32_t * __restrict out, uint32_t max_words,
-                                  uint32_t ncls, bool * __restrict out_has_tq) {
+                                  uint32_t ncls, bool tq_v4, bool * __restrict out_has_tq) {
   zcrudp_tec_model_t *tm = (zcrudp_tec_model_t *)p->zcvid_ec_model[slot];
   const uint32_t num_px = p->width * p->height;
   zcrudp_rc_dec_t rc;
@@ -2818,7 +3209,7 @@ static uint32_t zcvid_ec_get_chunk(gpu_pipeline_t * __restrict p, uint32_t slot,
     } else if (cls == 8U) {
       zcrudp_tec_run_reset(tm);
       if (!zcvid_tq_get(&rc, tm, count, out + words,
-                       (p->width + 3U) >> 2, (p->height + 3U) >> 2)) return UINT32_MAX;
+                       (p->width + 3U) >> 2, (p->height + 3U) >> 2, tq_v4)) return UINT32_MAX;
       has_tq = true;
       words += count * 2U;
       continue;
@@ -2915,6 +3306,7 @@ typedef struct {
   double chunk_us[ZCVID_EC_MAX_CHUNKS];     /* ZCVID_PROFILE per-chunk wall time */
   zcvid_mv_dec_job_t *mv_job;               /* optional overlapped MV decode (job 0) */
   uint32_t ncls;                           /* record classes in the layout */
+  bool tq_v4;                              /* CABAC v4 exact 8x8 DCT8 superblocks */
 } zcvid_ec_job_t;
 
 static void zcvid_ec_put_job(void *ctx, uint32_t i) {
@@ -2923,7 +3315,8 @@ static void zcvid_ec_put_job(void *ctx, uint32_t i) {
   bool prof = j->p->zcvid_prof_en;
   if (prof) QueryPerformanceCounter(&t0);
   j->len[i] = zcvid_ec_put_chunk(j->p, i, j->rec, j->keys + j->first[i],
-                                j->first[i + 1U] - j->first[i], j->ncls, j->buf[i], j->cap[i]);
+                                j->first[i + 1U] - j->first[i], j->ncls, j->tq_v4,
+                                j->buf[i], j->cap[i]);
   if (prof) {
     QueryPerformanceCounter(&t1);
     j->chunk_us[i] = qpc_delta_us(t0, t1);
@@ -2946,7 +3339,7 @@ static void zcvid_ec_get_job(void *ctx, uint32_t idx) {
   if (prof) QueryPerformanceCounter(&t0);
   j->has_tq[i] = false;
   j->ok[i] = zcvid_ec_get_chunk(j->p, i, j->buf[i], j->cap[i], j->out[i], j->words[i],
-                               j->ncls, &j->has_tq[i]) == j->words[i];
+                               j->ncls, j->tq_v4, &j->has_tq[i]) == j->words[i];
   if (prof) {
     QueryPerformanceCounter(&t1);
     j->chunk_us[i] = qpc_delta_us(t0, t1);
@@ -2992,6 +3385,7 @@ static size_t zcvid_ec_pack_records(gpu_pipeline_t *p, const uint32_t *rec,
   job.keys = keys;
   job.mv_job = NULL;
   job.ncls = p->zcvid_ncls;
+  job.tq_v4 = p->zcvid_tq && p->zcvid_dct8;
   /* Measured RC-decision cost weights per record class:
    *   delta (0..5): 20; intra2 (6): 24; intra4 (7): 34;
    *   class-8 tq: +4 new SB, +3 new 4x4 block, +2 extra coef. */
@@ -3181,7 +3575,7 @@ static size_t zcvid_ec_pack_records(gpu_pipeline_t *p, const uint32_t *rec,
       zcvid_radix_sort_256(ta, tb, tq_n, kor ^ kand);
       plain_keys = a;
     }
-    total += zcvid_pack_sorted(rec, plain_keys, plain_records, p->zcvid_ncls, o);
+    total += zcvid_pack_sorted(rec, plain_keys, plain_records, p->zcvid_ncls, o, job.tq_v4);
   }
   return total;
 }
@@ -3191,7 +3585,7 @@ static size_t zcvid_ec_pack_records(gpu_pipeline_t *p, const uint32_t *rec,
  * the word count, or UINT32_MAX on a malformed stream. */
 static uint32_t zcvid_ec_unpack_records_ex(gpu_pipeline_t *p, const uint8_t *in, size_t in_len,
                                           uint32_t *out, uint32_t max_words, uint32_t ncls,
-                                          zcvid_mv_dec_job_t *mv_job) {
+                                          bool tq_v4, zcvid_mv_dec_job_t *mv_job) {
   if (in_len < 1U) return UINT32_MAX;
   const uint32_t chunks = in[0];
   if (chunks < 1U || chunks > ZCVID_EC_MAX_CHUNKS || in_len < 1U + (size_t)chunks * 8U) {
@@ -3201,6 +3595,7 @@ static uint32_t zcvid_ec_unpack_records_ex(gpu_pipeline_t *p, const uint8_t *in,
   job.p = p;
   job.mv_job = mv_job;
   job.ncls = ncls;
+  job.tq_v4 = tq_v4;
   const uint8_t *data = in + 1U + (size_t)chunks * 8U;
   size_t left = in_len - 1U - (size_t)chunks * 8U;
   uint32_t total_words = 0;
@@ -3243,7 +3638,7 @@ static uint32_t zcvid_ec_unpack_records_ex(gpu_pipeline_t *p, const uint8_t *in,
   if (total_words < max_words) {
     /* The records the encoder had no time to range-code. */
     uint32_t plain = zcvid_unpack_records(data, left, out + total_words,
-                                         max_words - total_words, ncls);
+                                         max_words - total_words, ncls, tq_v4);
     if (plain == UINT32_MAX) return UINT32_MAX;
     if (ncls >= 9U && plain > 0U) any_tq = true;
     total_words += plain;
@@ -3253,8 +3648,9 @@ static uint32_t zcvid_ec_unpack_records_ex(gpu_pipeline_t *p, const uint8_t *in,
 }
 
 static inline uint32_t zcvid_ec_unpack_records(gpu_pipeline_t *p, const uint8_t *in, size_t in_len,
-                                              uint32_t *out, uint32_t max_words, uint32_t ncls) {
-  return zcvid_ec_unpack_records_ex(p, in, in_len, out, max_words, ncls, NULL);
+                                              uint32_t *out, uint32_t max_words, uint32_t ncls,
+                                              bool tq_v4) {
+  return zcvid_ec_unpack_records_ex(p, in, in_len, out, max_words, ncls, tq_v4, NULL);
 }
 
 /* Record words per frame a side can afford to range-code or decode.
@@ -4230,6 +4626,7 @@ int gpu_pipeline_create_zcvid(gpu_pipeline_t **out_pipe, uint32_t width,
   p->zcvid_qpel = true;
   p->zcvid_tq = true;
   p->zcvid_tq_inter = true;
+  p->zcvid_dct8 = true;
   p->zcvid_dither = true;
   p->zcvid_pack_ratio_q16 = 32768U;
   p->zcvid_ec_ratio_q16 = 16384U;
@@ -4689,6 +5086,10 @@ void gpu_pipeline_zcvid_set_qpel(gpu_pipeline_t *p, bool enable) {
 
 void gpu_pipeline_zcvid_set_transform_inter(gpu_pipeline_t *p, bool enable) {
   if (p && p->use_zcvid) p->zcvid_tq_inter = enable;
+}
+
+void gpu_pipeline_zcvid_set_dct8(gpu_pipeline_t *p, bool enable) {
+  if (p && p->use_zcvid) p->zcvid_dct8 = enable;
 }
 
 void gpu_pipeline_zcvid_set_entropy(gpu_pipeline_t *p, bool enable) {
@@ -5527,6 +5928,7 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
     if (!run_tq && !kf_burst && p->zcvid_intra8) mode_flags |= 2U;
     if (run_tq) mode_flags |= 4U;
     if (run_tq && p->zcvid_tq_inter) mode_flags |= 8U;
+    if (run_tq && p->zcvid_dct8) mode_flags |= 256U;
     bool frame_qpel = p->zcvid_qpel;
     if (frame_qpel) mode_flags |= 16U;
     /* bit 5: allow GPU scene-cut burst (gated by cooldown so sustained fast
@@ -5856,6 +6258,7 @@ int gpu_pipeline_capture_and_encode(gpu_pipeline_t *p, uint32_t frame_idx,
     uint32_t hdr_word = p->zcvid_packed ? (ZCVID_PACKED_FLAG | record_words) : record_words;
     p->zcvid_ncls = p->zcvid_tq ? 9U : 8U;
     if (p->zcvid_packed && p->zcvid_tq) hdr_word |= ZCVID_V2_FLAG;
+    if (p->zcvid_packed && p->zcvid_tq && p->zcvid_dct8) hdr_word |= ZCVID_TQ_V4_FLAG;
     if (p->zcvid_packed && ec_mv && mv_bytes > 0U) {
       hdr_word |= ZCVID_EC_MV_FLAG;
     } else if (p->zcvid_packed && wide_mv && mv_bytes > 0U) {
@@ -6451,6 +6854,7 @@ int gpu_pipeline_decode_and_present(gpu_pipeline_t *p,
           p->zcvid_dec_unpack_buf = nb;
           p->zcvid_dec_unpack_cap = record_words;
         }
+        bool tq_v4 = (hdr_word & ZCVID_TQ_V4_FLAG) != 0U;
         if ((hdr_word & ZCVID_EC_FLAG) != 0U) {
           if (ncls >= 9U && (hdr_word & ZCVID_TQ_V3_FLAG) == 0U) return -1;
           LARGE_INTEGER q0, q1;
@@ -6459,10 +6863,10 @@ int gpu_pipeline_decode_and_present(gpu_pipeline_t *p,
           got_words = overlap_mv
                           ? zcvid_ec_unpack_records_ex(p, bitstream + 8U + mv_bytes,
                                                       len - 8U - mv_bytes, p->zcvid_dec_unpack_buf,
-                                                      record_words, ncls, &mv_job)
+                                                      record_words, ncls, tq_v4, &mv_job)
                           : zcvid_ec_unpack_records(p, bitstream + 8U + mv_bytes,
                                                    len - 8U - mv_bytes, p->zcvid_dec_unpack_buf,
-                                                   record_words, ncls);
+                                                   record_words, ncls, tq_v4);
           QueryPerformanceCounter(&q1);
           if (got_words != UINT32_MAX) {
             zcvid_ec_note_time(&p->zcvid_ec_dec_nsw_q8, q0, q1, got_words);
@@ -6471,7 +6875,7 @@ int gpu_pipeline_decode_and_present(gpu_pipeline_t *p,
           }
         } else {
           got_words = zcvid_unpack_records(bitstream + 8U + mv_bytes, len - 8U - mv_bytes,
-                                          p->zcvid_dec_unpack_buf, record_words, ncls);
+                                          p->zcvid_dec_unpack_buf, record_words, ncls, tq_v4);
           frame_has_tq = (ncls >= 9U && got_words > 0U);
         }
         if (got_words == UINT32_MAX) return -1;

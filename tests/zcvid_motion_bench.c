@@ -228,6 +228,7 @@ int main(int argc, char **argv) {
     if (getenv("EC")) gpu_pipeline_zcvid_set_entropy(gpu, env_flag("EC", true));
     if (getenv("TQ")) gpu_pipeline_zcvid_set_transform(gpu, env_flag("TQ", true));
     if (getenv("TQI")) gpu_pipeline_zcvid_set_transform_inter(gpu, env_flag("TQI", true));
+    if (getenv("DCT8")) gpu_pipeline_zcvid_set_dct8(gpu, env_flag("DCT8", true));
     if (getenv("QPEL")) gpu_pipeline_zcvid_set_qpel(gpu, env_flag("QPEL", true));
     if (getenv("DITHER")) gpu_pipeline_zcvid_set_dither(gpu, env_flag("DITHER", true));
     if (getenv("ECLIMIT")) gpu_pipeline_zcvid_set_entropy_limit(gpu, (uint32_t)atoi(getenv("ECLIMIT")));
@@ -414,10 +415,11 @@ int main(int argc, char **argv) {
       const uint32_t *recs_ptr = NULL;
       if (rw > 0U) {
         if (pk_rec) {
+          bool tq_v4 = (hw & ZCVID_TQ_V4_FLAG) != 0U;
           if (hw & ZCVID_EC_FLAG) {
-            got_w = zcvid_ec_unpack_records(gpu, bs + 8U + mvb, len - 8U - mvb, rt_w, rw, ncls);
+            got_w = zcvid_ec_unpack_records(gpu, bs + 8U + mvb, len - 8U - mvb, rt_w, rw, ncls, tq_v4);
           } else {
-            got_w = zcvid_unpack_records(bs + 8U + mvb, len - 8U - mvb, rt_w, rw, ncls);
+            got_w = zcvid_unpack_records(bs + 8U + mvb, len - 8U - mvb, rt_w, rw, ncls, tq_v4);
           }
           if (got_w == UINT32_MAX) { dec_err++; got_w = 0U; }
           recs_ptr = rt_w;
@@ -490,7 +492,8 @@ int main(int argc, char **argv) {
       if (hw & ZCVID_EC_FLAG) {
         ec_frames++;
         uint32_t rw = hw & ZCVID_RECORD_WORDS_MASK;
-        uint32_t got = zcvid_ec_unpack_records(gpu, bs + 8 + mvb, len - 8 - mvb, rt_w, rw, (hw & ZCVID_V2_FLAG) ? 9U : 8U);
+        bool tq_v4 = (hw & ZCVID_TQ_V4_FLAG) != 0U;
+        uint32_t got = zcvid_ec_unpack_records(gpu, bs + 8 + mvb, len - 8 - mvb, rt_w, rw, (hw & ZCVID_V2_FLAG) ? 9U : 8U, tq_v4);
         D3D11_MAPPED_SUBRESOURCE m2 = {0};
         if (got != rw) rt_bad++;
         if (getenv("FUZZ") && fr % 8U == 0U) {
@@ -502,7 +505,7 @@ int main(int argc, char **argv) {
             for (unsigned q = 0; q < nflip; ++q) fz[(size_t)rand() * 7919U % bl] ^= (uint8_t)(1U << (rand() & 7));
             size_t cut = (it & 1U) ? bl : (size_t)rand() * 131U % (bl + 1);
             if (it >= 30U) for (size_t q = 0; q < bl; ++q) fz[q] = (uint8_t)rand();
-            uint32_t g = zcvid_ec_unpack_records(gpu, fz, cut, rt_w, rw, (hw & ZCVID_V2_FLAG) ? 9U : 8U);
+            uint32_t g = zcvid_ec_unpack_records(gpu, fz, cut, rt_w, rw, (hw & ZCVID_V2_FLAG) ? 9U : 8U, tq_v4);
             if (g != UINT32_MAX && g > rw) rt_bad += 1000;
             fuzz_runs++;
           }

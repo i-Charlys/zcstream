@@ -108,6 +108,13 @@ void gpu_pipeline_zcvid_set_transform(gpu_pipeline_t *pipe, bool enable);
 void gpu_pipeline_zcvid_set_transform_inter(gpu_pipeline_t *pipe, bool enable);
 
 /**
+ * Enables the exact 12-mul factored HEVC 8x8 DCT8 superblock transform
+ * (pred = 4 intra / 5 inter, CABAC v4 CSBF/ESR) instead of legacy 8x8
+ * bilinear-upsampled 4x4 (pred = 2 / 3). Negotiated via ZCEC caps bit 3.
+ */
+void gpu_pipeline_zcvid_set_dct8(gpu_pipeline_t *pipe, bool enable);
+
+/**
  * Tile vectors in quarter pels (bilinear motion compensation, integer and
  * bit-exact on both sides). Marked in the stream by a byte after the
  * vectors; a decoder built before it would apply them as whole pels.
