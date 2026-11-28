@@ -1,8 +1,25 @@
 # zcstream
 
-Ultra-low-latency GPU video streaming prototypes built on top of [`zcrudp::nextgen`](../zcrudp), combining:
+[![CI](https://github.com/i-Charlys/zcstream/actions/workflows/ci.yml/badge.svg)](https://github.com/i-Charlys/zcstream/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Formal Model: TLA+](https://img.shields.io/badge/Model-TLA%2B%20%2F%20TLC-6e40c9.svg)](proofs/README.md)
+
+Ultra-low-latency GPU & CPU video streaming pipelines and Parsec/Moonlight-style bidirectional peripheral I/O, built on top of [`zcrudp`](../zcrudp) and [`zcvid`](../zcvid):
+
 1. **Direct NVENC (`nvEncodeAPI64.dll`) + D3D11/DXGI Zero-Copy** (`zcrudp_stream_bench.exe`)
 2. **Pyrowave (Vulkan Compute Wavelets) + Winsock RIO Batch TX** (`zcrudp_pyrowave_bench.exe`)
+3. **Zcvid HLSL/CPU Hybrid Pipeline + Live Desktop Streamer** (`zcrudp_zcvid_bench.exe`, `zcrudp_stream.exe`) with full peripheral I/O
+
+> [!NOTE]
+> **AI-Built Project & Systems Benchmark**
+>
+> Together with [`zcstream-app`](https://github.com/i-Charlys/zcstream-app) and [`zcvid`](https://github.com/i-Charlys/zcvid), `zcstream` is **designed, written, benchmarked, and model-checked by AI** as a real-world engineering benchmark covering DXGI Desktop Duplication, D3D11 HLSL compute shaders, NVENC/Vulkan GPU interop, Winsock RIO batching, low-latency peripheral forwarding, and TLA+ protocol verification (`proofs/ZcTransport.tla`).
+>
+> Benchmarks compare our custom Zcvid pipeline directly against NVIDIA hardware NVENC H.264 on identical fractional-motion sequences—documenting openly both where Zcvid wins and where NVENC remains ahead (`2.9`–`4.3 dB` on camera panning), alongside experiments tested and discarded.
+>
+> The underlying network transport (`zcrudp`) and NAT traversal (`zpsync`) live in separate companion repositories.
+
+---
 
 ## Measured Pipeline Latency (NVIDIA TITAN RTX, 1920×1080 @ 120 fps, loopback)
 
@@ -10,8 +27,31 @@ Ultra-low-latency GPU video streaming prototypes built on top of [`zcrudp::nextg
 | :--- | :--- | :--- | :--- |
 | **NVENC Direct (H.264, 25 Mbps, ARGB Zero-Copy)** | ~2.6 ms | ~82 µs | **3.33 ms** *(min 2.23 ms)* |
 | **Pyrowave (Wavelets, ~120 Mbps) + Winsock RIO** | **~0.50 ms** *(0.29 + 0.21 ms)* | ~785 µs *(~105 pkts/frame)* | **1.33 ms** *(min 1.20 ms)* |
+| **Zcvid HLSL Hybrid (25 Mbps, pacing + EC + QPel)** | ~0.96–1.31 ms *(0.5–0.7 ms CPU dec)* | ~170 µs TX p50 | **0.83–1.31 ms** *(0 px drift)* |
 
 Under simulated degraded network (`--nasty`: 5% random loss + 8% 3-pkt bursts + 15% reordering + 5% duplicates + 2–5 ms OWD/jitter), Cauchy $\mathrm{GF}(2^8)$ FEC (`--fec 3`) runs in **32 µs p50 TX** and recovers frames in 0-RTT.
+
+---
+
+## Parsec / Moonlight-Style Peripheral I/O (`src/zc_periph.h`, `src/zc_periph.c`)
+
+`zcrudp_stream` provides bidirectional input and audio forwarding designed for remote desktop and game streaming:
+
+| Channel | Wire Magic | Payload / Codec | `zcrudp_stream` CLI Flags |
+| :--- | :--- | :--- | :--- |
+| **Keyboard & Mouse** | `ZCI1` (`20 B`) | AT Set 1 scancodes, normalized absolute (`0..65535`) & relative mouse deltas, buttons (`L/R/M/X1/X2`), H/V wheel | `--input` / `--no-input` *(default: on)* |
+| **Gamepads (×4)** | `ZCGP` (`24 B`) | Up to `4` XInput-compatible controllers (bitmask buttons, `LT`/`RT`, dual sticks) | `--gamepad` / `--no-gamepad` *(default: on)* |
+| **Host Audio → Client** | `ZCA0` | 48 kHz system loopback (`10 ms` / `480`-sample frames, IMA-ADPCM) | `--audio` / `--no-audio`, `--audio-out <dev>` *(default: on)* |
+| **Client Mic → Host** | `ZCM0` | 48 kHz microphone capture → virtual/host playback (`10 ms` / `480`-sample frames, IMA-ADPCM) | `--mic` / `--no-mic`, `--audio-in <dev>` *(default: off)* |
+| **Device Discovery** | — | Enumerates monitors, audio output/loopback devices, microphones, and controllers | `--list-devices` |
+
+---
+
+## Transport Model Checking (TLA+ / TLC)
+
+`proofs/ZcTransport.tla` exhaustively models the live `zcrudp_stream` reliability engine (64-frame history, 32 RX slots, 3 ms/10 ms `ZCNK` retries, 100 ms give-up, 150 ms `ZCSY` intra-resync, 200 ms tail probe linger). TLC verified `InOrder`, `Consistent`, `NoSilentCorruption`, and `Ends` across up to 7.9M states (`deliver4`, `safe6`, `burst4`, `resync4`) and uncovered a silent-corruption bug when skipping >8 frames or initial frames before first delivery—fixed in `src/stream_live.c` and documented in [`proofs/README.md`](proofs/README.md).
+
+---
 
 ## Zcvid HLSL pipeline (`zcrudp_zcvid_bench.exe`)
 
@@ -294,6 +334,8 @@ the resends leaves the last frame a few pixels off the encoder (seen once,
 17 pixels, under `--nasty`). `zcrudp_stream` resyncs and lost no frame in
 the same conditions.
 
+---
+
 ## Benchmark options
 
 All three benchmarks accept `--frames N`, `--width W`, `--height H`,
@@ -314,6 +356,8 @@ of 239 fragments apart cannot both be rebuilt.
 Once Winsock RIO is enabled on a socket, every datagram (data, parity,
 delayed packets) goes through RIO: ordinary `WSASendTo` calls were observed
 to fail on the connected `WSA_FLAG_REGISTERED_IO` socket these benchmarks use.
+
+---
 
 ## Quick Install & Build (Zero-Config)
 
@@ -340,3 +384,11 @@ ctest --test-dir build --output-on-failure   # fragment/FEC bridge & portable pi
 ```
 
 *(Optional for `zcrudp_pyrowave_bench`: place `Themaister/pyrowave` in `third_party/pyrowave-master` and build `libpyrowave.a`.)*
+
+---
+
+## License & Citations
+
+This repository is licensed under the **MIT License** — see [LICENSE](LICENSE).
+
+Third-party attributions (`Pyrowave`, FFmpeg `nv-codec-headers`) and scientific/standards references (Cauchy FEC, H.264/HEVC, Jayant ADM, TLA+) are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
